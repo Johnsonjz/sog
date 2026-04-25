@@ -1,0 +1,5 @@
+use_atomwise: false
+n_dl: 2.0
+remove_self_interaction: true
+use_nufft: true
+nufft_eps: 1.0e-4
