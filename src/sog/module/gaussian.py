@@ -51,15 +51,6 @@ class Gaussian(nn.Module):
             raise ValueError("`n_dl` should be a positive finite number.")
         self.n_dl = n_dl_value
 
-        if amp is None:
-            if b <= 0.0:
-                raise ValueError("`b` should be positive when `amp` is not provided.")
-            amp_value = float(4.0 * torch.pi * math.log(b))
-        else:
-            amp_value = float(amp)
-        if not math.isfinite(amp_value):
-            raise ValueError("`amp` should be finite.")
-
         if bandwidth is None:
             if sigma <= 0.0:
                 raise ValueError("`sigma` should be positive when `bandwidth` is not provided.")
@@ -77,12 +68,30 @@ class Gaussian(nn.Module):
             raise ValueError("`bandwidth` should be finite.")
         if torch.any(bw <= 0.0):
             raise ValueError("`bandwidth` values should be positive.")
+        bw2 = bw.square()
 
-        self.amp = nn.Parameter(
-            torch.tensor([amp_value], dtype=torch.get_default_dtype()),
-            requires_grad=trainable,
-        )
-        self.bandwidth = nn.Parameter(bw, requires_grad=trainable)
+        if amp is None:
+            if b <= 0.0:
+                raise ValueError("`b` should be positive when `amp` is not provided.")
+            coef1 = float(4.0 * torch.pi * math.log(b))
+            amp_tensor = torch.full_like(bw2, fill_value=coef1)
+        else:
+            amp_tensor = torch.as_tensor(amp, dtype=torch.get_default_dtype()).reshape(-1)
+        if amp_tensor.numel() == 0:
+            raise ValueError("`amp` should not be empty.")
+        if not torch.isfinite(amp_tensor).all():
+            raise ValueError("`amp` should be finite.")
+
+        # Allow scalar amp and broadcast it to all Gaussian terms.
+        if amp_tensor.numel() == 1 and bw2.numel() > 1:
+            amp_tensor = amp_tensor.expand_as(bw2).clone()
+        elif amp_tensor.numel() != bw2.numel():
+            raise ValueError(
+                "`amp` should be scalar or have the same length as `bandwidth`."
+            )
+
+        self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
+        self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
 
         self.remove_self_interaction = bool(remove_self_interaction)
         self.charge_neutral_lambda = charge_neutral_lambda
@@ -269,9 +278,9 @@ class Gaussian(nn.Module):
         r_ij = r_raw.unsqueeze(0) - r_raw.unsqueeze(1)
         r_sq = torch.sum(r_ij * r_ij, dim=-1, keepdim=True)
 
-        amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).reshape(-1)[0]
-        bw = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
-        kernel = amp * torch.exp(-0.5 * r_sq / (bw * bw))
+        amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        bw2 = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        kernel = amp * torch.exp(-0.5 * r_sq / bw2)
         kernel = kernel.sum(dim=-1)
 
         diag = torch.arange(n, device=r_raw.device)
@@ -281,12 +290,7 @@ class Gaussian(nn.Module):
         pot = 0.5 * torch.sum(pair_q * kernel.unsqueeze(-1))
 
         if not self.remove_self_interaction:
-            k0 = torch.sum(
-                amp
-                * torch.ones_like(
-                    self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device)
-                )
-            )
+            k0 = amp.sum()
             pot = pot + 0.5 * torch.sum(q * q) * k0
 
         return pot * self.norm_factor
@@ -367,8 +371,13 @@ class Gaussian(nn.Module):
         g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
         k_sq = torch.sum(g_cart * g_cart, dim=0)
 
-        amp = self.amp.to(dtype=real_dtype, device=runtime_device).reshape(-1)[0]
-        bw2 = self.bandwidth.to(dtype=real_dtype, device=runtime_device).square().view(
+        amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(
+            1,
+            1,
+            1,
+            -1,
+        )
+        bw2 = self.bandwidth.to(dtype=real_dtype, device=runtime_device).view(
             1,
             1,
             1,

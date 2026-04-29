@@ -99,7 +99,18 @@ class DeepMDSOGReference:
         q_dim: int,
         deepmd_source: Optional[str] = None,
     ) -> "DeepMDSOGReference":
-        amp = float(gaussian.amp.detach().reshape(-1)[0].cpu().item())
+        amp_tensor = gaussian.amp.detach().reshape(-1).cpu()
+        if amp_tensor.numel() == 0:
+            raise ValueError("Gaussian amp is empty.")
+        if amp_tensor.numel() == 1:
+            amp = float(amp_tensor[0].item())
+        else:
+            if not torch.allclose(amp_tensor, amp_tensor[:1].expand_as(amp_tensor)):
+                raise ValueError(
+                    "DeepMDSOGReference currently supports scalar amp only, "
+                    "but Gaussian uses per-term amp values."
+                )
+            amp = float(amp_tensor[0].item())
         bw = gaussian.bandwidth.detach().reshape(-1).cpu().tolist()
         n_dl = float(gaussian.n_dl)
         remove_si = bool(gaussian.remove_self_interaction)

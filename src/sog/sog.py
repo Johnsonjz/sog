@@ -91,11 +91,8 @@ class Sog(nn.Module):
         latent_charges: Optional[torch.Tensor] = None,
         batch: Optional[torch.Tensor] = None,
         compute_energy: bool = True,
-        compute_force: bool = False,
-        compute_virial: bool = False,
         compute_bec: bool = False,
         bec_output_index: Optional[int] = None,
-        use_explicit_derivatives: bool = True,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.int64, device=positions.device)
@@ -112,58 +109,15 @@ class Sog(nn.Module):
         else:
             raise ValueError("Either desc or latent_charges must be provided")
 
-        need_energy = bool(compute_energy or compute_force or compute_virial)
-
-        e_lr = None
-        used_explicit_derivatives = False
-        need_force_internal = bool(compute_force or compute_virial)
-
-        if compute_bec or need_force_internal:
-            positions = positions.requires_grad_(True)
-
-        if need_energy:
-            if need_force_internal and use_explicit_derivatives:
-                bundle = self.gaussian.compute_bundle(
-                    q=latent_charges,
-                    r=positions,
-                    cell=cell,
-                    batch=batch,
-                    compute_force=True,
-                    compute_virial=compute_virial,
-                )
-                e_lr = bundle["energy"]
-                used_explicit_derivatives = bool(bundle["used_explicit_derivatives"])
-            else:
-                bundle = None
-                e_lr = self.gaussian(
-                    q=latent_charges,
-                    r=positions,
-                    cell=cell,
-                    batch=batch,
-                )
+        if compute_energy:
+            e_lr = self.gaussian(
+                q=latent_charges,
+                r=positions,
+                cell=cell,
+                batch=batch,
+            )
         else:
-            bundle = None
-
-        forces = None
-        virial = None
-        if need_force_internal:
-            if used_explicit_derivatives and bundle is not None:
-                forces = bundle["forces"]
-                virial = bundle["virial"] if compute_virial else None
-            else:
-                assert e_lr is not None
-                grad_pos = torch.autograd.grad(
-                    outputs=[e_lr.sum()],
-                    inputs=[positions],
-                    retain_graph=(compute_virial or compute_bec),
-                    create_graph=compute_virial,
-                    allow_unused=False,
-                )[0]
-                assert grad_pos is not None
-                forces = -grad_pos
-
-                if compute_virial:
-                    virial = self._batch_virial(forces, positions, batch)
+            e_lr = None
 
         bec = None
         if compute_bec:
@@ -178,25 +132,8 @@ class Sog(nn.Module):
         return {
             "E_lr": e_lr,
             "latent_charges": latent_charges,
-            "forces": forces,
-            "virial": virial,
             "BEC": bec,
-            "used_explicit_derivatives": used_explicit_derivatives,
         }
-
-    @staticmethod
-    def _batch_virial(
-        forces: torch.Tensor,
-        positions: torch.Tensor,
-        batch: torch.Tensor,
-    ) -> torch.Tensor:
-        out = []
-        for bid_t in torch.unique(batch):
-            mask = batch == bid_t
-            f_now = forces[mask]
-            r_now = positions[mask]
-            out.append(torch.einsum("ni,nj->ij", f_now, r_now))
-        return torch.stack(out, dim=0)
 
 
 class _DummyAtomwise(nn.Module):
