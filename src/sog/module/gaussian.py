@@ -318,6 +318,7 @@ class Gaussian(nn.Module):
                 state["g_cart"],
                 state["kfac"],
                 state["volume"],
+                state["k_mode_mask"],
             )
 
         if self.remove_self_interaction:
@@ -370,6 +371,7 @@ class Gaussian(nn.Module):
 
         g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
         k_sq = torch.sum(g_cart * g_cart, dim=0)
+        k_mode_mask = (~zero_mask) & (k_sq <= k_sq_max)
 
         amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(
             1,
@@ -384,7 +386,7 @@ class Gaussian(nn.Module):
             -1,
         )
         kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
-        kfac = kfac.sum(dim=-1).masked_fill(zero_mask | (k_sq > k_sq_max), 0.0)
+        kfac = kfac.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
 
         diag_sum = kfac.sum() / (2.0 * volume)
 
@@ -394,6 +396,7 @@ class Gaussian(nn.Module):
             "r_in": r_in,
             "g_cart": g_cart,
             "kfac": kfac,
+            "k_mode_mask": k_mode_mask,
             "output_shape": output_shape,
             "volume": volume,
             "diag_sum": diag_sum,
@@ -503,11 +506,18 @@ class Gaussian(nn.Module):
         g_cart: torch.Tensor,
         kfac: torch.Tensor,
         volume: torch.Tensor,
+        k_mode_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         kvec = g_cart.reshape(3, -1).transpose(0, 1)
         kfac_flat = kfac.reshape(-1)
 
-        mask = kfac_flat != 0
+        if k_mode_mask is None:
+            # Fallback for old call sites.
+            mask = kfac_flat != 0
+        else:
+            # Keep semantics consistent with condition=(k==0) and cutoff filtering.
+            mask = k_mode_mask.reshape(-1)
+
         if not torch.any(mask):
             return torch.zeros((), dtype=r_raw.dtype, device=r_raw.device)
 
