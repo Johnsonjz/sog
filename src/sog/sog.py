@@ -62,7 +62,6 @@ class Sog(nn.Module):
             nufft_eps=self.nufft_eps,
             norm_factor=self.norm_factor,
             trainable=self.trainable_kernel,
-            nufft=self.nufft,
         )
 
         self.bec = BEC(
