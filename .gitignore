@@ -4,6 +4,19 @@ __pycache__/
 
 .pytest_cache/
 
+.mypy_cache/
+
 *.egg-info/
 build/
 dist/
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+.python-version
+
+# IDE
+.vscode/
+.idea/

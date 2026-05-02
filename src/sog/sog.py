@@ -8,10 +8,17 @@ import torch.nn as nn
 from .module import Atomwise, BEC, Gaussian
 
 
+RCUT_TO_SIGMA = 1.9892536839080267
+
+
 class Sog(nn.Module):
     """SOG plugin model with LES-like API."""
 
-    def __init__(self, sog_arguments: Union[Dict[str, Any], str, None] = None):
+    def __init__(
+        self,
+        sog_arguments: Union[Dict[str, Any], str, None] = None,
+        r_cut: Optional[float] = None,
+    ):
         super().__init__()
 
         if sog_arguments is None:
@@ -22,6 +29,10 @@ class Sog(nn.Module):
             with open(sog_arguments, "r", encoding="utf-8") as f:
                 parsed = yaml.safe_load(f)
             sog_arguments = {} if parsed is None else parsed
+
+        if r_cut is not None:
+            sog_arguments = dict(sog_arguments)
+            sog_arguments["r_cut"] = r_cut
 
         self._parse_arguments(sog_arguments)
 
@@ -47,10 +58,11 @@ class Sog(nn.Module):
             m=self.m,
             remove_self_interaction=self.remove_self_interaction,
             charge_neutral_lambda=self.charge_neutral_lambda,
-            use_nufft=self.use_nufft,
+            use_nufft=self.nufft,
             nufft_eps=self.nufft_eps,
             norm_factor=self.norm_factor,
             trainable=self.trainable_kernel,
+            nufft=self.nufft,
         )
 
         self.bec = BEC(
@@ -71,11 +83,19 @@ class Sog(nn.Module):
         self.amp = args.get("amp", None)
         self.bandwidth = args.get("bandwidth", None)
         self.b = float(args.get("b", 1.62976708826776469))
-        self.sigma = float(args.get("sigma", 2.180230445405648))
+        r_cut_arg = args.get("r_cut", None)
+        self.r_cut = float(r_cut_arg) if r_cut_arg is not None else None
+        if self.r_cut is not None:
+            if self.r_cut <= 0.0:
+                raise ValueError("`r_cut` should be positive.")
+            self.sigma = self.r_cut / RCUT_TO_SIGMA
+        else:
+            self.sigma = float(args.get("sigma", 2.180230445405648))
         self.m = int(args.get("m", 12))
         self.remove_self_interaction = bool(args.get("remove_self_interaction", True))
         self.charge_neutral_lambda = args.get("charge_neutral_lambda", None)
-        self.use_nufft = bool(args.get("use_nufft", True))
+        self.nufft = bool(args.get("nufft", args.get("use_nufft", False)))
+        self.use_nufft = self.nufft
         self.nufft_eps = float(args.get("nufft_eps", 1e-4))
         self.norm_factor = float(args.get("norm_factor", 14.3996454784255))
         self.trainable_kernel = bool(args.get("trainable_kernel", True))

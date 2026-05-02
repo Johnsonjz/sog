@@ -16,7 +16,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 E2_PER_ANGSTROM_TO_EV = 14.3996454784255
-SOG_DEFAULT_B = 1.62976708826776469
+SOG_DEFAULT_B = 2
 SOG_DEFAULT_SIGMA = 2.180230445405648
 SOG_DEFAULT_M = 12
 
@@ -24,7 +24,7 @@ SOG_DEFAULT_M = 12
 class Gaussian(nn.Module):
     """Gaussian long-range SOG core.
 
-    Periodic systems are computed in reciprocal space (NUFFT preferred), and
+    Periodic systems are computed in reciprocal space when NUFFT is enabled,
     non-periodic/singular-cell inputs fall back to a direct real-space kernel.
     """
 
@@ -38,11 +38,12 @@ class Gaussian(nn.Module):
         m: int = SOG_DEFAULT_M,
         remove_self_interaction: bool = True,
         charge_neutral_lambda: Optional[float] = None,
-        use_nufft: bool = True,
-        nufft_eps: float = 1e-4,
+        use_nufft: bool = False,
+        nufft_eps: float = 1e-6,
         norm_factor: float = E2_PER_ANGSTROM_TO_EV,
         trainable: bool = True,
         max_cache_size: int = 8,
+        nufft: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -95,7 +96,7 @@ class Gaussian(nn.Module):
 
         self.remove_self_interaction = bool(remove_self_interaction)
         self.charge_neutral_lambda = charge_neutral_lambda
-        self.use_nufft = bool(use_nufft)
+        self.use_nufft = bool(use_nufft if nufft is None else nufft)
         self.nufft_eps = float(nufft_eps)
         self.norm_factor = float(norm_factor)
 
@@ -131,7 +132,15 @@ class Gaussian(nn.Module):
         )
         cached = self._kgrid_base_cache.get(cache_key)
         if cached is not None:
-            return cached
+            k_cached, zero_mask_cached, output_shape_cached = cached
+            # Be defensive against stale caches carried across save/load or device moves.
+            if (
+                k_cached.device == runtime_device
+                and k_cached.dtype == real_dtype
+                and zero_mask_cached.device == runtime_device
+            ):
+                return cached
+            self._kgrid_base_cache.pop(cache_key, None)
 
         n1 = torch.arange(-nk[0], nk[0] + 1, device=runtime_device, dtype=real_dtype)
         n2 = torch.arange(-nk[1], nk[1] + 1, device=runtime_device, dtype=real_dtype)
