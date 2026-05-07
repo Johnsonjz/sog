@@ -90,6 +90,7 @@ class Gaussian(nn.Module):
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
+        amp_tensor *= bw2
 
         self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
         self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
@@ -394,7 +395,7 @@ class Gaussian(nn.Module):
             1,
             -1,
         )
-        kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
+        kfac = amp * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
         kfac = kfac.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
 
         diag_sum = kfac.sum() / (2.0 * volume)
