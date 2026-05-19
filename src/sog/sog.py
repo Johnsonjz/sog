@@ -81,7 +81,7 @@ class Sog(nn.Module):
         self.n_dl = float(args.get("n_dl", 1.0))
         self.amp = args.get("amp", None)
         self.bandwidth = args.get("bandwidth", None)
-        self.b = float(args.get("b", 1.62976708826776469))
+        self.b = float(args.get("b", 2.0))
         r_cut_arg = args.get("r_cut", None)
         self.r_cut = float(r_cut_arg) if r_cut_arg is not None else None
         if self.r_cut is not None:
