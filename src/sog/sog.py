@@ -12,7 +12,18 @@ RCUT_TO_SIGMA = 1.9892536839080267
 
 
 class Sog(nn.Module):
-    """SOG plugin model with LES-like API."""
+    """
+    Important ``sog_arguments`` keys
+    -------------------------------
+    kernel_param_mode : {"raw", "internal"}
+        Controls interpretation of ``amp``/``bandwidth``.
+    kernel_tensor_mode : {"owned", "external", "auto"}
+        Controls whether Gaussian owns kernel parameters or binds caller tensors.
+
+    Legacy bool keys are still supported for compatibility:
+    ``amp_is_internal``, ``bandwidth_is_squared``,
+    ``use_external_kernel_tensors``.
+    """
 
     def __init__(
         self,
@@ -62,6 +73,8 @@ class Sog(nn.Module):
             nufft_eps=self.nufft_eps,
             norm_factor=self.norm_factor,
             trainable=self.trainable_kernel,
+            kernel_param_mode=self.kernel_param_mode,
+            kernel_tensor_mode=self.kernel_tensor_mode,
         )
 
         self.bec = BEC(
@@ -81,6 +94,57 @@ class Sog(nn.Module):
         self.n_dl = float(args.get("n_dl", 1.0))
         self.amp = args.get("amp", None)
         self.bandwidth = args.get("bandwidth", None)
+
+        # Preferred concise API.
+        self.kernel_param_mode = str(args.get("kernel_param_mode", "raw")).strip().lower()
+        self.kernel_tensor_mode = str(args.get("kernel_tensor_mode", "owned")).strip().lower()
+
+        # Backward compatibility for older bool-style config keys.
+        legacy_amp_is_internal = args.get("amp_is_internal", None)
+        legacy_bw_is_squared = args.get("bandwidth_is_squared", None)
+        if (legacy_amp_is_internal is not None) or (legacy_bw_is_squared is not None):
+            amp_flag = bool(
+                False if legacy_amp_is_internal is None else legacy_amp_is_internal
+            )
+            bw_flag = bool(
+                False if legacy_bw_is_squared is None else legacy_bw_is_squared
+            )
+            if amp_flag != bw_flag:
+                raise ValueError(
+                    "Legacy keys `amp_is_internal` and `bandwidth_is_squared` "
+                    "should be consistent (both true or both false)."
+                )
+            legacy_mode = "internal" if amp_flag else "raw"
+            if self.kernel_param_mode not in {"raw", "internal"}:
+                raise ValueError(
+                    "`kernel_param_mode` should be 'raw' or 'internal'."
+                )
+            if args.get("kernel_param_mode", None) is not None and self.kernel_param_mode != legacy_mode:
+                raise ValueError(
+                    "Conflicting values between `kernel_param_mode` and legacy bool keys."
+                )
+            self.kernel_param_mode = legacy_mode
+
+        legacy_external = args.get("use_external_kernel_tensors", None)
+        if legacy_external is not None:
+            legacy_tensor_mode = "external" if bool(legacy_external) else "owned"
+            if self.kernel_tensor_mode not in {"owned", "external", "auto"}:
+                raise ValueError(
+                    "`kernel_tensor_mode` should be 'owned', 'external', or 'auto'."
+                )
+            if args.get("kernel_tensor_mode", None) is not None and self.kernel_tensor_mode != legacy_tensor_mode:
+                raise ValueError(
+                    "Conflicting values between `kernel_tensor_mode` and legacy bool key `use_external_kernel_tensors`."
+                )
+            self.kernel_tensor_mode = legacy_tensor_mode
+
+        if self.kernel_param_mode not in {"raw", "internal"}:
+            raise ValueError("`kernel_param_mode` should be 'raw' or 'internal'.")
+        if self.kernel_tensor_mode not in {"owned", "external", "auto"}:
+            raise ValueError(
+                "`kernel_tensor_mode` should be 'owned', 'external', or 'auto'."
+            )
+
         self.b = float(args.get("b", 2.0))
         r_cut_arg = args.get("r_cut", None)
         self.r_cut = float(r_cut_arg) if r_cut_arg is not None else None

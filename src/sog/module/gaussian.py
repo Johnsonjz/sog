@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,11 +21,43 @@ SOG_DEFAULT_SIGMA = 2.180230445405648
 SOG_DEFAULT_M = 12
 
 
+def _as_1d_tensor_keep_input(value: object) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.reshape(-1)
+    return torch.as_tensor(value, dtype=torch.get_default_dtype()).reshape(-1)
+
+
+def _normalize_mode(value: str, valid: set[str], name: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in valid:
+        raise ValueError(
+            f"`{name}` should be one of {sorted(valid)}, got {value!r}."
+        )
+    return mode
+
+
+def _is_differentiable_tensor(value: object) -> bool:
+    return isinstance(value, torch.Tensor) and bool(value.requires_grad)
+
+
 class Gaussian(nn.Module):
     """Gaussian long-range SOG core.
 
     Periodic systems are computed in reciprocal space when NUFFT is enabled,
     non-periodic/singular-cell inputs fall back to a direct real-space kernel.
+
+    Parameters
+    ----------
+    kernel_param_mode : str
+        Parameter interpretation mode.
+        - ``"raw"``: ``amp`` is raw coefficient and ``bandwidth`` is bw.
+        - ``"internal"``: ``amp`` is internal amplitude and ``bandwidth`` is bw^2.
+    kernel_tensor_mode : str
+        Tensor ownership/binding mode.
+        - ``"owned"``: Gaussian owns ``nn.Parameter`` tensors.
+        - ``"external"``: Gaussian directly binds caller tensors.
+        - ``"auto"``: external binding when differentiable tensor inputs are
+          detected and ``trainable=False``.
     """
 
     def __init__(
@@ -44,8 +76,26 @@ class Gaussian(nn.Module):
         trainable: bool = True,
         max_cache_size: int = 8,
         nufft: Optional[bool] = None,
+        kernel_param_mode: str = "raw",
+        kernel_tensor_mode: str = "owned",
+        **_kwargs: Any,
     ):
         super().__init__()
+
+        if _kwargs:
+            unknown = ", ".join(sorted(_kwargs.keys()))
+            raise TypeError(f"Unexpected keyword arguments: {unknown}")
+
+        param_mode = _normalize_mode(
+            kernel_param_mode,
+            {"raw", "internal"},
+            "kernel_param_mode",
+        )
+        tensor_mode = _normalize_mode(
+            kernel_tensor_mode,
+            {"owned", "external", "auto"},
+            "kernel_tensor_mode",
+        )
 
         n_dl_value = float(n_dl)
         if (not math.isfinite(n_dl_value)) or n_dl_value <= 0.0:
@@ -60,16 +110,23 @@ class Gaussian(nn.Module):
                 torch.tensor(float(b), dtype=torch.get_default_dtype()),
                 torch.arange(m_value, dtype=torch.get_default_dtype()),
             )
+            bw2 = bw.square()
         else:
-            bw = torch.as_tensor(bandwidth, dtype=torch.get_default_dtype()).reshape(-1)
+            bw_in = _as_1d_tensor_keep_input(bandwidth)
 
-        if bw.numel() == 0:
+        if bandwidth is None:
+            bw_check = bw
+        else:
+            bw_check = bw_in
+
+        if bw_check.numel() == 0:
             raise ValueError("`bandwidth` should not be empty.")
-        if not torch.isfinite(bw).all():
+        if not torch.isfinite(bw_check).all():
             raise ValueError("`bandwidth` should be finite.")
-        if torch.any(bw <= 0.0):
+        if torch.any(bw_check <= 0.0):
             raise ValueError("`bandwidth` values should be positive.")
-        bw2 = bw.square()
+        if bandwidth is not None:
+            bw2 = bw_in if param_mode == "internal" else bw_in.square()
 
         if amp is None:
             if b <= 0.0:
@@ -77,7 +134,7 @@ class Gaussian(nn.Module):
             coef1 = float(4.0 * torch.pi * math.log(b))
             amp_tensor = torch.full_like(bw2, fill_value=coef1)
         else:
-            amp_tensor = torch.as_tensor(amp, dtype=torch.get_default_dtype()).reshape(-1)
+            amp_tensor = _as_1d_tensor_keep_input(amp)
         if amp_tensor.numel() == 0:
             raise ValueError("`amp` should not be empty.")
         if not torch.isfinite(amp_tensor).all():
@@ -90,10 +147,24 @@ class Gaussian(nn.Module):
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
-        amp_tensor *= bw2
+        
+        if (param_mode == "raw") or (amp is None):
+            amp_tensor *= bw2
 
-        self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
-        self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
+        use_external = tensor_mode == "external"
+        if tensor_mode == "auto":
+            use_external = (not trainable) and (
+                _is_differentiable_tensor(amp) or _is_differentiable_tensor(bandwidth)
+            )
+
+        if use_external:
+            # Keep references to external tensors so autograd can flow back to
+            # the caller-owned parameters (e.g. upstream fitting nets).
+            self.amp = amp_tensor
+            self.bandwidth = bw2
+        else:
+            self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
+            self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
 
         self.remove_self_interaction = bool(remove_self_interaction)
         self.charge_neutral_lambda = charge_neutral_lambda
