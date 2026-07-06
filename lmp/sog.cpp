@@ -1759,7 +1759,7 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
         //   a1 = [Lx, 0, 0], a2 = [xy, Ly, 0], a3 = [xz, yz, Lz]
         double xy = domain->xy, xz_d = domain->xz, yz = domain->yz;
         double V = Lx * Ly * Lz;
-        double twopi_over_V = 2.0 * M_PI / V;
+        double twopi_over_V = 2.0 * MY_PI / V;
 
         // |b1|² from a2×a3 = [Ly·Lz, −xy·Lz, xy·yz − Ly·xz]
         double b1_sq = (Ly*Lz)*(Ly*Lz) + (xy*Lz)*(xy*Lz)
@@ -1776,7 +1776,7 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
         k_min_sq = std::min({b1_sq, b2_sq, b3_sq});
       } else {
         double L_max = std::max({Lx, Ly, Lz});
-        k_min_sq = (2.0 * M_PI / L_max) * (2.0 * M_PI / L_max);
+        k_min_sq = (2.0 * MY_PI / L_max) * (2.0 * MY_PI / L_max);
       }
 
       double kfac_eff = 0.0;

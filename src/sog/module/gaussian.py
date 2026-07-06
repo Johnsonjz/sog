@@ -264,6 +264,13 @@ class Gaussian(nn.Module):
             Tuple[str, str, int, int, int],
             Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]],
         ] = {}
+        # Cache for prefiltered direct-path k-space state, keyed by box + n_dl.
+        # Avoids recomputing g_cart, kfac, diag_sum when the box is unchanged
+        # (NVT training, multi-system with fixed boxes).
+        self._direct_state_cache: Dict[
+            Tuple[str, str, int, tuple],
+            Dict[str, torch.Tensor],
+        ] = {}
 
     @staticmethod
     def _device_key(device: torch.device) -> str:
@@ -406,6 +413,7 @@ class Gaussian(nn.Module):
 
                     state = self._prepare_triclinic_state(
                         r_fft, q_fft, box_now, compute_spectral=False,
+                        compute_r_in=False,
                         _volume=volume,
                     )
 
@@ -609,7 +617,11 @@ class Gaussian(nn.Module):
         cell_now: torch.Tensor,
         _volume: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        state = self._prepare_triclinic_state(r_raw, q, cell_now, _volume=_volume)
+        state = self._prepare_triclinic_state(
+            r_raw, q, cell_now, _volume=_volume,
+            compute_r_in=self.use_nufft and HAS_PYTORCH_FINUFFT,
+            prefilter=not (self.use_nufft and HAS_PYTORCH_FINUFFT),
+        )
 
         if self.use_nufft and HAS_PYTORCH_FINUFFT:
             pot = self._compute_periodic_nufft(
@@ -643,13 +655,22 @@ class Gaussian(nn.Module):
         q: torch.Tensor,
         cell_now: torch.Tensor,
         compute_spectral: bool = True,
+        compute_r_in: bool = True,
         _volume: Optional[torch.Tensor] = None,
+        prefilter: bool = False,
     ) -> Dict[str, torch.Tensor | Tuple[int, int, int]]:
         """Prepare triclinic state for periodic computations.
 
         When compute_spectral=False (FFT path), skips the expensive k-space
         kernel computation (kfac, mask, diag_sum) — the FFT solver computes
         its own spectral kernel on the FFT grid.
+
+        When compute_r_in=False (direct path), skips fractional coordinate
+        computation — r_in is only needed for the NUFFT path.
+
+        When prefilter=True (direct path), stores flat filtered k-vectors
+        and kfac instead of full 3D grids — avoids computing kfac on masked
+        (~50%) grid points. The NUFFT path needs the full 3D grid.
         """
         if q.dim() == 1:
             q = q.unsqueeze(1)
@@ -666,17 +687,22 @@ class Gaussian(nn.Module):
                 raise ValueError("`cell` is singular (near-zero volume).")
             volume = torch.abs(volume)
 
-        cell_inv = torch.linalg.inv(box)
-        r_frac = torch.matmul(r_raw, cell_inv)
-        r_frac = torch.remainder(r_frac + 0.5, 1.0) - 0.5
+        if compute_r_in or compute_spectral:
+            cell_inv = torch.linalg.inv(box)
+        if compute_r_in:
+            r_frac = torch.matmul(r_raw, cell_inv)
+            r_frac = torch.remainder(r_frac + 0.5, 1.0) - 0.5
 
-        pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
-        point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
-        r_in = torch.clamp(
-            2.0 * pi_tensor * r_frac,
-            min=-point_limit,
-            max=point_limit,
-        ).contiguous()
+            pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
+            point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
+            r_in = torch.clamp(
+                2.0 * pi_tensor * r_frac,
+                min=-point_limit,
+                max=point_limit,
+            ).contiguous()
+        else:
+            pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
+            r_in = torch.empty(0, dtype=real_dtype, device=runtime_device)
 
         if not compute_spectral:
             # Fast path for FFT: skip expensive spectral kernel computation.
@@ -705,6 +731,33 @@ class Gaussian(nn.Module):
         norms = torch.norm(box, dim=1)
         nk = tuple(max(1, int(v.item() / _n_dl)) for v in norms)
 
+        # ── Direct-path cache: skip g_cart/kfac/diag_sum when box is unchanged ──
+        if prefilter:
+            box_hash = tuple(
+                float(x)
+                for x in box.detach().reshape(-1).mul(1e6).round().div(1e6).tolist()
+            )
+            cache_key = (self._device_key(runtime_device), str(real_dtype),
+                         int(round(_n_dl, 8)), box_hash)
+            cached = self._direct_state_cache.get(cache_key)
+            if cached is not None:
+                g_cart_c, kfac_c, diag_c = cached
+                if (g_cart_c.device == runtime_device and g_cart_c.dtype == real_dtype
+                        and kfac_c.device == runtime_device
+                        and diag_c.device == runtime_device):
+                    return {
+                        "r_raw": r_raw,
+                        "q": q,
+                        "r_in": r_in,
+                        "g_cart": g_cart_c,
+                        "kfac": kfac_c,
+                        "k_mode_mask": torch.empty(0, dtype=torch.bool,
+                                                   device=runtime_device),
+                        "output_shape": (0, 0, 0),
+                        "volume": volume,
+                        "diag_sum": diag_c,
+                    }
+
         k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
             nk,
             runtime_device,
@@ -719,29 +772,38 @@ class Gaussian(nn.Module):
         k_sq = torch.sum(g_cart * g_cart, dim=0)
         k_mode_mask = (~zero_mask) & (k_sq <= k_sq_max)
 
-        amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(
-            1,
-            1,
-            1,
-            -1,
-        )
-        bw2 = self.bandwidth.to(dtype=real_dtype, device=runtime_device).view(
-            1,
-            1,
-            1,
-            -1,
-        )
-        kfac = amp * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
-        kfac = kfac.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
+        amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(1, -1)
+        bw2 = self.bandwidth.to(dtype=real_dtype, device=runtime_device).view(1, -1)
 
-        diag_sum = kfac.sum() / (2.0 * volume)
+        if prefilter:
+            # Direct path: compute kfac only on valid k-points (k≠0, k≤k_max).
+            # Avoids wasted exp() on ~50% of the grid that would be masked.
+            mask_flat = k_mode_mask.reshape(-1)
+            g_cart_out = g_cart.reshape(3, -1)[:, mask_flat]         # [3, K]
+            k_sq_flat = k_sq.reshape(-1)[mask_flat]                   # [K]
+            kfac_out = (amp * torch.exp(-0.5 * bw2 * k_sq_flat.unsqueeze(-1))).sum(dim=-1)  # [K]
+            diag_sum = kfac_out.sum() / (2.0 * volume)
+            # Cache for future frames with the same box.
+            self._direct_state_cache[cache_key] = (
+                g_cart_out.detach(), kfac_out.detach(), diag_sum.detach())
+            if len(self._direct_state_cache) > self._max_cache_size:
+                oldest = next(iter(self._direct_state_cache.keys()))
+                self._direct_state_cache.pop(oldest, None)
+        else:
+            # NUFFT path / legacy: full 3D grid with masked_fill.
+            amp_3d = amp.view(1, 1, 1, -1)
+            bw2_3d = bw2.view(1, 1, 1, -1)
+            kfac_out = amp_3d * torch.exp(-0.5 * bw2_3d * k_sq.unsqueeze(-1))
+            kfac_out = kfac_out.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
+            g_cart_out = g_cart
+            diag_sum = kfac_out.sum() / (2.0 * volume)
 
         return {
             "r_raw": r_raw,
             "q": q,
             "r_in": r_in,
-            "g_cart": g_cart,
-            "kfac": kfac,
+            "g_cart": g_cart_out,
+            "kfac": kfac_out,
             "k_mode_mask": k_mode_mask,
             "output_shape": output_shape,
             "volume": volume,
@@ -854,26 +916,34 @@ class Gaussian(nn.Module):
         volume: torch.Tensor,
         k_mode_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        kvec = g_cart.reshape(3, -1).transpose(0, 1)
-        kfac_flat = kfac.reshape(-1)
-
-        if k_mode_mask is None:
-            # Fallback for old call sites.
-            mask = kfac_flat != 0
+        # Detect flat vs 3D input: flat tensors are [3,K] / [K] (prefiltered),
+        # 3D tensors are [3,nx,ny,nz] / [nx,ny,nz] (legacy / NUFFT path).
+        if g_cart.dim() == 2:
+            # Prefiltered flat input — k=0 and k>k_max already excluded.
+            kvec = g_cart.transpose(0, 1)          # [K, 3]
+            kfac_flat = kfac                        # [K]
         else:
-            # Keep semantics consistent with condition=(k==0) and cutoff filtering.
-            mask = k_mode_mask.reshape(-1)
+            # Legacy 3D input — apply k_mode_mask.
+            kvec = g_cart.reshape(3, -1).transpose(0, 1)
+            kfac_flat = kfac.reshape(-1)
 
-        if not torch.any(mask):
+            if k_mode_mask is None:
+                mask = kfac_flat != 0
+            else:
+                mask = k_mode_mask.reshape(-1)
+
+            if not torch.any(mask):
+                return torch.zeros((), dtype=r_raw.dtype, device=r_raw.device)
+
+            kvec = kvec[mask]
+            kfac_flat = kfac_flat[mask]
+
+        if kvec.shape[0] == 0:
             return torch.zeros((), dtype=r_raw.dtype, device=r_raw.device)
-
-        kvec = kvec[mask]
-        kfac_flat = kfac_flat[mask]
 
         # Exploit Fourier space symmetry: K(k²)=K(|-k|²) and |S(-k)|²=|S(k)|².
         # Keep only half-sphere k-vectors, multiply result by 2.
-        # k=0 is already excluded by k_mode_mask (via zero_mask), so every
-        # remaining k has a distinct -k partner — clean partition guaranteed.
+        # k=0 is already excluded, so every remaining k has a distinct -k partner.
         half_mask = (
             (kvec[:, 0] > 0)
             | ((kvec[:, 0] == 0) & (kvec[:, 1] > 0))
