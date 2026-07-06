@@ -62,11 +62,15 @@ class Sog(nn.Module):
 
         self.gaussian = Gaussian(
             n_dl=self.n_dl,
+            cubes2_phi_max=self.cubes2_phi_max,
+            cubes2_order=self.cubes2_order,
             amp=self.amp,
             bandwidth=self.bandwidth,
             b=self.b,
             sigma=self.sigma,
             m=self.m,
+            rcut=self.r_cut,
+            nlayers=self.nlayers,
             remove_self_interaction=self.remove_self_interaction,
             charge_neutral_lambda=self.charge_neutral_lambda,
             use_nufft=self.nufft,
@@ -75,6 +79,7 @@ class Sog(nn.Module):
             trainable=self.trainable_kernel,
             kernel_param_mode=self.kernel_param_mode,
             kernel_tensor_mode=self.kernel_tensor_mode,
+            use_cubes2_fft=self.use_cubes2_fft,
         )
 
         self.bec = BEC(
@@ -91,7 +96,18 @@ class Sog(nn.Module):
         self.add_linear_nn = bool(args.get("add_linear_nn", True))
         self.output_scaling_factor = float(args.get("output_scaling_factor", 0.1))
 
-        self.n_dl = float(args.get("n_dl", 1.0))
+        self.n_dl = float(args["n_dl"]) if args.get("n_dl") is not None else None
+        self.cubes2_phi_max = args.get("cubes2_phi_max", None)
+        if self.cubes2_phi_max is not None:
+            self.cubes2_phi_max = float(self.cubes2_phi_max)
+            # Conflict detection: user specified both explicitly
+            if "n_dl" in args:
+                raise ValueError(
+                    "Cannot specify both `cubes2_phi_max` and `n_dl`. "
+                    "Use `cubes2_phi_max` (φ = Δ/r_c, recommended) or remove "
+                    "`n_dl` to auto-default from Predescu 2020 Table III."
+                )
+        self.cubes2_order = int(args.get("cubes2_order", 4))
         self.amp = args.get("amp", None)
         self.bandwidth = args.get("bandwidth", None)
 
@@ -146,12 +162,14 @@ class Sog(nn.Module):
             )
 
         self.b = float(args.get("b", 2.0))
-        r_cut_arg = args.get("r_cut", None)
+        r_cut_arg = args.get("r_cut", args.get("rcut", None))
         self.r_cut = float(r_cut_arg) if r_cut_arg is not None else None
+        self.use_cubes2_fft = bool(args.get("use_cubes2_fft", False))
+        self.nlayers = int(args.get("nlayers", 1))
         if self.r_cut is not None:
             if self.r_cut <= 0.0:
                 raise ValueError("`r_cut` should be positive.")
-            self.sigma = self.r_cut / RCUT_TO_SIGMA
+            self.sigma = self.r_cut * self.nlayers / RCUT_TO_SIGMA
         else:
             self.sigma = float(args.get("sigma", 2.180230445405648))
         self.m = int(args.get("m", 12))

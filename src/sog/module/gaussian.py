@@ -19,6 +19,7 @@ E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 SOG_DEFAULT_B = 2
 SOG_DEFAULT_SIGMA = 2.180230445405648
 SOG_DEFAULT_M = 12
+RCUT_TO_SIGMA = 1.9892536839080267  # r_c/σ for b=2, C¹ continuity (midtown-sog.md)
 
 
 def _as_1d_tensor_keep_input(value: object) -> torch.Tensor:
@@ -38,6 +39,29 @@ def _normalize_mode(value: str, valid: set[str], name: str) -> str:
 
 def _is_differentiable_tensor(value: object) -> bool:
     return isinstance(value, torch.Tensor) and bool(value.requires_grad)
+
+
+def _compute_w0(r0: float, b: float, nterms: int = 500, tol: float = 1e-14) -> float:
+    """Compute w0 — real-space correction factor (fastsog.cpp:318-328).
+
+    w0 = (1/G(1,r0)) * (1/(2*ln(b)*r0) - Σ b^{-i} * G(1, b^{-i}*r0))
+    where G(sigma, r) = exp(-r²/(2*sigma²))/sqrt(2*pi*sigma²)
+
+    Uses adaptive convergence: stops when |term| < tol * |sum|.
+    """
+    import math as _math
+    G = lambda s, r: _math.exp(-r * r / (2.0 * s * s)) / _math.sqrt(2.0 * _math.pi * s * s)
+    s = 0.0
+    abs_sum = 0.0
+    for i in range(1, nterms + 1):
+        bi = b ** (-i)
+        term = bi * G(1.0, bi * r0)
+        s += term
+        abs_sum += abs(term)
+        if i >= 10 and abs(term) < tol * max(abs_sum, 1e-30):
+            break
+    w0 = (1.0 / G(1.0, r0)) * (1.0 / (2.0 * _math.log(b) * r0) - s)
+    return w0
 
 
 class Gaussian(nn.Module):
@@ -62,12 +86,14 @@ class Gaussian(nn.Module):
 
     def __init__(
         self,
-        n_dl: float = 1.0,
+        n_dl: Optional[float] = None,
         amp: Optional[float] = None,
         bandwidth: Optional[torch.Tensor] = None,
         b: float = SOG_DEFAULT_B,
         sigma: float = SOG_DEFAULT_SIGMA,
         m: int = SOG_DEFAULT_M,
+        rcut: Optional[float] = None,
+        nlayers: int = 1,
         remove_self_interaction: bool = True,
         charge_neutral_lambda: Optional[float] = None,
         use_nufft: bool = False,
@@ -78,6 +104,9 @@ class Gaussian(nn.Module):
         nufft: Optional[bool] = None,
         kernel_param_mode: str = "raw",
         kernel_tensor_mode: str = "owned",
+        use_cubes2_fft: bool = False,
+        cubes2_phi_max: Optional[float] = None,
+        cubes2_order: int = 4,
         **_kwargs: Any,
     ):
         super().__init__()
@@ -97,25 +126,50 @@ class Gaussian(nn.Module):
             "kernel_tensor_mode",
         )
 
-        n_dl_value = float(n_dl)
-        if (not math.isfinite(n_dl_value)) or n_dl_value <= 0.0:
-            raise ValueError("`n_dl` should be a positive finite number.")
-        self.n_dl = n_dl_value
+        self.self_coeff = 0.0  # real-space self-energy (fastsog convention)
+
+        if n_dl is not None:
+            n_dl_value = float(n_dl)
+            if (not math.isfinite(n_dl_value)) or n_dl_value <= 0.0:
+                raise ValueError("`n_dl` should be a positive finite number.")
+            self.n_dl = n_dl_value
+        else:
+            self.n_dl = None
+
+        # Validate cubes2_phi_max
+        if cubes2_phi_max is not None:
+            phi_val = float(cubes2_phi_max)
+            if not math.isfinite(phi_val) or phi_val <= 0.0:
+                raise ValueError("`cubes2_phi_max` should be a positive finite number.")
+
+        # Paper-consistent sigma: σ = rcut · nlayers / RCUT_TO_SIGMA (midtown-sog.md, b=2 C¹)
+        use_fastsog_conv = (rcut is not None and rcut > 0)
+        if use_fastsog_conv:
+            sigma = float(rcut) * int(nlayers) / RCUT_TO_SIGMA
 
         if bandwidth is None:
             if sigma <= 0.0:
                 raise ValueError("`sigma` should be positive when `bandwidth` is not provided.")
             m_value = max(1, int(m))
-            bw = sigma * torch.pow(
-                torch.tensor(float(b), dtype=torch.get_default_dtype()),
-                torch.arange(m_value, dtype=torch.get_default_dtype()),
-            )
-            bw2 = bw.square()
+            if use_fastsog_conv:
+                # fastsog.cpp convention: bandwidth[m] = sigma^2 * b^{2m}
+                sigma2 = sigma * sigma
+                b2 = float(b) * float(b)
+                bw2 = torch.zeros(m_value, dtype=torch.get_default_dtype())
+                bw2[0] = sigma2
+                for mm in range(1, m_value):
+                    bw2[mm] = bw2[mm - 1] * b2
+            else:
+                bw = sigma * torch.pow(
+                    torch.tensor(float(b), dtype=torch.get_default_dtype()),
+                    torch.arange(m_value, dtype=torch.get_default_dtype()),
+                )
+                bw2 = bw.square()
         else:
             bw_in = _as_1d_tensor_keep_input(bandwidth)
 
         if bandwidth is None:
-            bw_check = bw
+            bw_check = bw2
         else:
             bw_check = bw_in
 
@@ -131,10 +185,35 @@ class Gaussian(nn.Module):
         if amp is None:
             if b <= 0.0:
                 raise ValueError("`b` should be positive when `amp` is not provided.")
-            coef1 = float(4.0 * torch.pi * math.log(b))
-            amp_tensor = torch.full_like(bw2, fill_value=coef1)
+            if use_fastsog_conv:
+                # fastsog.cpp convention (line 530-541):
+                #   amp[0] = 4*pi*log(b) * w0 * sigma^2
+                #   amp[1] = 4*pi*log(b) * sigma^2 * b^2
+                #   amp[m] = amp[m-1] * b^2   (m >= 2)
+                sigma2 = sigma * sigma
+                b2 = float(b) * float(b)
+                logb = math.log(float(b))
+                r0 = float(rcut) / sigma
+                w0 = _compute_w0(r0, float(b))
+                amp_factor = 4.0 * math.pi * logb
+                amp_tensor = torch.zeros(m_value, dtype=torch.get_default_dtype())
+                amp_tensor[0] = amp_factor * w0 * sigma2
+                if m_value > 1:
+                    amp_tensor[1] = amp_factor * sigma2 * b2
+                for mm in range(2, m_value):
+                    amp_tensor[mm] = amp_tensor[mm - 1] * b2
+
+                # Real-space self-energy (fastsog.cpp line 544-551)
+                sum_b_inv = 0.0
+                for mm in range(1, m_value):
+                    sum_b_inv += float(b) ** (-mm)
+                self.self_coeff = (logb / (math.sqrt(2.0 * math.pi) * sigma)) * (w0 + sum_b_inv)
+            else:
+                coef1 = float(4.0 * math.pi * math.log(float(b)))
+                amp_tensor = torch.full_like(bw2, fill_value=coef1)
         else:
             amp_tensor = _as_1d_tensor_keep_input(amp)
+            self.self_coeff = 0.0
         if amp_tensor.numel() == 0:
             raise ValueError("`amp` should not be empty.")
         if not torch.isfinite(amp_tensor).all():
@@ -147,9 +226,10 @@ class Gaussian(nn.Module):
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
-        
+
         if (param_mode == "raw") or (amp is None):
-            amp_tensor *= bw2
+            if not use_fastsog_conv:
+                amp_tensor *= bw2
 
         use_external = tensor_mode == "external"
         if tensor_mode == "auto":
@@ -171,6 +251,13 @@ class Gaussian(nn.Module):
         self.use_nufft = bool(use_nufft if nufft is None else nufft)
         self.nufft_eps = float(nufft_eps)
         self.norm_factor = float(norm_factor)
+
+        # CubeS₂ + PyTorch FFT path (replaces direct sum during training)
+        self.use_cubes2_fft = bool(use_cubes2_fft)
+        self.cubes2_phi_max = float(cubes2_phi_max) if cubes2_phi_max is not None else None
+        self.cubes2_order = int(cubes2_order)
+        self.rcut = float(rcut) if rcut is not None else None
+        self.b = float(b)
 
         self._max_cache_size = max(1, int(max_cache_size))
         self._kgrid_base_cache: Dict[
@@ -286,14 +373,104 @@ class Gaussian(nn.Module):
 
             periodic = False
             box_now = None
+            volume = None
             if cell is not None:
                 box_now = cell[bid]
-                det_now = torch.det(box_now)
-                periodic = torch.abs(det_now) > torch.finfo(box_now.dtype).eps
+                volume = torch.abs(torch.det(box_now))
+                periodic = volume > torch.finfo(box_now.dtype).eps
 
-            if periodic and need_force and self.use_nufft and HAS_PYTORCH_FINUFFT:
+            if periodic and self.use_cubes2_fft:
+                # ── CubeS₂ + PyTorch FFT path (autograd-compatible) ──
+                from .cubes2_fft import (
+                    XI_4,
+                    Cubes2FFTFunction,
+                    compute_cubes2_fft as _cubes2_fft,
+                )
+                from .cubes2_spline import _get_xi
+
                 assert box_now is not None
-                state = self._prepare_triclinic_state(r_now, q_now, box_now)
+
+                # Multi-channel: compute each channel separately and sum.
+                # This avoids spurious cross-channel interactions that would
+                # arise from replicating positions on a single FFT grid.
+                nq_local = q_now.shape[1] if q_now.dim() > 1 else 1
+
+                pot_now = 0.0
+                f_ch_list = []
+                v_ch_list = []
+
+                for ch in range(nq_local):
+                    q_ch = q_now[:, ch] if nq_local > 1 else q_now.reshape(-1)
+                    r_fft = r_now
+                    q_fft = q_ch.reshape(-1)
+
+                    state = self._prepare_triclinic_state(
+                        r_fft, q_fft, box_now, compute_spectral=False,
+                        _volume=volume,
+                    )
+
+                    if need_force or compute_virial:
+                        result = _cubes2_fft(
+                            q=state["q"].reshape(-1),
+                            r=state["r_raw"],
+                            cell=box_now,
+                            amp=self.amp,
+                            bw2=self.bandwidth,
+                            volume=state["volume"],
+                            diag_sum=state["diag_sum"],
+                            cubes2_phi_max=self.cubes2_phi_max,
+                            n_dl=self.n_dl if self.cubes2_phi_max is None else None,
+                            r_c=self.rcut,
+                            b=self.b,
+                            xi=_get_xi(self.cubes2_order),
+                            order=self.cubes2_order,
+                            remove_self_interaction=self.remove_self_interaction,
+                            self_coeff=self.self_coeff,
+                            norm_factor=self.norm_factor,
+                            compute_force=True,
+                            compute_virial=compute_virial,
+                        )
+                        pot_now += result["energy"]
+                        if result["forces"] is not None:
+                            f_ch = result["forces"]
+                            if f_ch.dim() == 3:
+                                f_ch = f_ch.squeeze(0)
+                            f_ch_list.append(f_ch)
+                        if result["virial"] is not None:
+                            v_ch_list.append(result["virial"])
+                    else:
+                        q_flat = state["q"].reshape(-1)
+                        volume_val = float(state["volume"].detach().item())
+                        diag_sum_val = float(state["diag_sum"].detach().item())
+                        e_ch = Cubes2FFTFunction.apply(
+                            q_flat,
+                            state["r_raw"],
+                            box_now,
+                            self.amp,
+                            self.bandwidth,
+                            volume_val,
+                            diag_sum_val,
+                            self.cubes2_phi_max,
+                            self.n_dl if self.cubes2_phi_max is None else None,
+                            self.rcut,
+                            self.b,
+                            self.cubes2_order,
+                            _get_xi(self.cubes2_order),
+                            self.remove_self_interaction,
+                            self.self_coeff,
+                            self.norm_factor,
+                        )
+                        pot_now += e_ch
+
+                # Sum forces and virial over channels
+                if f_ch_list:
+                    force_full[mask] = torch.stack(f_ch_list, dim=0).sum(dim=0)
+                if v_ch_list:
+                    virial_list.append(torch.stack(v_ch_list, dim=0).sum(dim=0))
+
+            elif periodic and need_force and self.use_nufft and HAS_PYTORCH_FINUFFT:
+                assert box_now is not None
+                state = self._prepare_triclinic_state(r_now, q_now, box_now, _volume=volume)
                 pot_now, force_now, virial_now = self._compute_periodic_nufft_bundle(
                     state,
                     need_force=True,
@@ -302,6 +479,9 @@ class Gaussian(nn.Module):
 
                 if self.remove_self_interaction:
                     pot_now = pot_now - torch.sum(q_now * q_now) * state["diag_sum"]
+                # Real-space self-energy (fastsog convention)
+                if self.self_coeff != 0.0:
+                    pot_now = pot_now - torch.sum(q_now * q_now) * self.self_coeff
 
                 pot_now = pot_now * self.norm_factor
                 force_now = force_now * self.norm_factor
@@ -319,15 +499,61 @@ class Gaussian(nn.Module):
 
                 if periodic:
                     assert box_now is not None
-                    pot_now = self.compute_potential_triclinic(r_now, q_now, box_now)
+                    pot_now = self.compute_potential_triclinic(r_now, q_now, box_now, _volume=volume)
                 else:
                     pot_now = self.compute_potential_realspace(r_now, q_now)
 
                 if virial_list is not None:
                     virial_list.append(torch.zeros((3, 3), dtype=r.dtype, device=r.device))
 
-            if self.charge_neutral_lambda is not None:
-                pot_now = pot_now + float(self.charge_neutral_lambda) * torch.mean(q_now).square()
+            # ── Physical k=0 correction (all paths: direct, FFT, NUFFT) ──
+            # k=0 is excluded in ALL paths → add it back.
+            # Charge term (always on): A·Q²/(2V) — physical cross-term.
+            # Self term (tied to remove_self_interaction): −A·Σq_i²/(2V).
+            #
+            # IMPORTANT: Do NOT use raw amp_sum = Σ_m amp_m for k=0 kernel value.
+            # amp[m] grows as b^(2m) (geometric growth, e.g. 2.17e6 for M=12).
+            # At k=0, exp(−½ bw²·0) = 1 for ALL m → dominated by high-m "inactive" terms.
+            # At any finite k (even the smallest on the grid), exp decay suppresses
+            # high-m terms, giving kfac ≈ 4π/k² consistent with Coulomb physics.
+            # The raw amp_sum at k=0 is a numerical artifact of the parameterization.
+            #
+            # Fix: evaluate the SOG kernel at the smallest physical |k| determined
+            # by the reciprocal lattice vectors: k_min = min(|b1|, |b2|, |b3|).
+            #   b_i = 2π · (a_j × a_k) / volume
+            # This handles both orthorhombic and triclinic boxes correctly.
+            # Gives kfac_eff ≈ Σ_m amp_m·exp(−½ bw²_m · k_min²), consistent
+            # with the k≠0 energy (same kernel, same convention).
+            if periodic and box_now is not None:
+                amp = self.amp.to(dtype=q_now.dtype, device=q_now.device)
+                bw2 = self.bandwidth.to(dtype=q_now.dtype, device=q_now.device)
+                # Minimum non-zero k-vector magnitude from reciprocal lattice.
+                # For orthorhombic: k_min = 2π / max(Lx, Ly, Lz).
+                a1, a2, a3 = box_now[0], box_now[1], box_now[2]
+                b1 = 2.0 * math.pi * torch.linalg.cross(a2, a3) / volume
+                b2 = 2.0 * math.pi * torch.linalg.cross(a3, a1) / volume
+                b3 = 2.0 * math.pi * torch.linalg.cross(a1, a2) / volume
+                k_min_sq = torch.min(torch.stack([
+                    torch.dot(b1, b1),
+                    torch.dot(b2, b2),
+                    torch.dot(b3, b3),
+                ]))
+                # Effective k=0 kernel value (regularized)
+                kfac_eff = (amp * torch.exp(-0.5 * bw2 * k_min_sq)).sum()
+
+                q_sum = q_now.sum()          # total charge (sum over atoms + channels)
+                e_k0_charge = kfac_eff * (q_sum ** 2) / (2.0 * volume) * self.norm_factor
+                pot_now = pot_now + e_k0_charge
+
+                if self.remove_self_interaction:
+                    q_sq_sum = (q_now ** 2).sum()
+                    e_k0_self = -kfac_eff * q_sq_sum / (2.0 * volume) * self.norm_factor
+                    pot_now = pot_now + e_k0_self
+
+            # Optional user override penalty (additional regularization):
+            if self.charge_neutral_lambda is not None and self.charge_neutral_lambda > 0:
+                e_penalty_per_ch = float(self.charge_neutral_lambda) * (q_now.mean(dim=0) ** 2).sum()
+                pot_now = pot_now + e_penalty_per_ch
 
             energies.append(pot_now)
 
@@ -381,8 +607,9 @@ class Gaussian(nn.Module):
         r_raw: torch.Tensor,
         q: torch.Tensor,
         cell_now: torch.Tensor,
+        _volume: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        state = self._prepare_triclinic_state(r_raw, q, cell_now)
+        state = self._prepare_triclinic_state(r_raw, q, cell_now, _volume=_volume)
 
         if self.use_nufft and HAS_PYTORCH_FINUFFT:
             pot = self._compute_periodic_nufft(
@@ -404,6 +631,9 @@ class Gaussian(nn.Module):
 
         if self.remove_self_interaction:
             pot = pot - torch.sum(state["q"] * state["q"]) * state["diag_sum"]
+        # Real-space self-energy (fastsog convention)
+        if self.self_coeff != 0.0:
+            pot = pot - torch.sum(state["q"] * state["q"]) * self.self_coeff
 
         return pot * self.norm_factor
 
@@ -412,7 +642,15 @@ class Gaussian(nn.Module):
         r_raw: torch.Tensor,
         q: torch.Tensor,
         cell_now: torch.Tensor,
+        compute_spectral: bool = True,
+        _volume: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor | Tuple[int, int, int]]:
+        """Prepare triclinic state for periodic computations.
+
+        When compute_spectral=False (FFT path), skips the expensive k-space
+        kernel computation (kfac, mask, diag_sum) — the FFT solver computes
+        its own spectral kernel on the FFT grid.
+        """
         if q.dim() == 1:
             q = q.unsqueeze(1)
 
@@ -420,10 +658,13 @@ class Gaussian(nn.Module):
         real_dtype = r_raw.dtype
 
         box = cell_now.to(dtype=real_dtype, device=runtime_device)
-        volume = torch.det(box)
-        if torch.abs(volume) <= torch.finfo(real_dtype).eps:
-            raise ValueError("`cell` is singular (near-zero volume).")
-        volume = torch.abs(volume)
+        if _volume is not None:
+            volume = _volume
+        else:
+            volume = torch.det(box)
+            if torch.abs(volume) <= torch.finfo(real_dtype).eps:
+                raise ValueError("`cell` is singular (near-zero volume).")
+            volume = torch.abs(volume)
 
         cell_inv = torch.linalg.inv(box)
         r_frac = torch.matmul(r_raw, cell_inv)
@@ -437,8 +678,32 @@ class Gaussian(nn.Module):
             max=point_limit,
         ).contiguous()
 
+        if not compute_spectral:
+            # Fast path for FFT: skip expensive spectral kernel computation.
+            # The FFT solver computes its own kfac on the FFT grid.
+            return {
+                "r_raw": r_raw,
+                "q": q,
+                "r_in": r_in,
+                "g_cart": torch.empty(0),    # not used by FFT path
+                "kfac": torch.empty(0),      # not used by FFT path
+                "k_mode_mask": torch.empty(0, dtype=torch.bool),  # not used
+                "output_shape": (0, 0, 0),   # not used by FFT path
+                "volume": volume,
+                "diag_sum": torch.tensor(0.0, dtype=real_dtype, device=runtime_device),
+            }
+
+        # Auto-compute n_dl from accuracy when not set (direct k-space path).
+        _n_dl = self.n_dl
+        if _n_dl is None:
+            bw_min = self.bandwidth.to(dtype=real_dtype, device=runtime_device).min().item()
+            # ε = 1e-5: n_dl = 2π / sqrt(2·ln(1/ε) / bw_min)
+            _eps = 1e-5
+            _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
+            _n_dl = 2.0 * math.pi / max(_kmax, 1e-30)
+
         norms = torch.norm(box, dim=1)
-        nk = tuple(max(1, int(v.item() / self.n_dl)) for v in norms)
+        nk = tuple(max(1, int(v.item() / _n_dl)) for v in norms)
 
         k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
             nk,
@@ -447,7 +712,7 @@ class Gaussian(nn.Module):
         )
 
         two_pi = 2.0 * pi_tensor
-        n_dl_tensor = torch.as_tensor(self.n_dl, dtype=real_dtype, device=runtime_device)
+        n_dl_tensor = torch.as_tensor(_n_dl, dtype=real_dtype, device=runtime_device)
         k_sq_max = (two_pi / n_dl_tensor) ** 2
 
         g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
@@ -605,6 +870,20 @@ class Gaussian(nn.Module):
         kvec = kvec[mask]
         kfac_flat = kfac_flat[mask]
 
+        # Exploit Fourier space symmetry: K(k²)=K(|-k|²) and |S(-k)|²=|S(k)|².
+        # Keep only half-sphere k-vectors, multiply result by 2.
+        # k=0 is already excluded by k_mode_mask (via zero_mask), so every
+        # remaining k has a distinct -k partner — clean partition guaranteed.
+        half_mask = (
+            (kvec[:, 0] > 0)
+            | ((kvec[:, 0] == 0) & (kvec[:, 1] > 0))
+            | ((kvec[:, 0] == 0) & (kvec[:, 1] == 0) & (kvec[:, 2] > 0))
+        )
+        kvec = kvec[half_mask]
+        kfac_flat = kfac_flat[half_mask]
+        # Each selected k represents a (k, -k) pair.
+        energy_factor = 2.0
+
         k_dot_r = torch.matmul(r_raw, kvec.transpose(0, 1))
         cos_k_dot_r = torch.cos(k_dot_r)
         sin_k_dot_r = torch.sin(k_dot_r)
@@ -613,7 +892,7 @@ class Gaussian(nn.Module):
         s_imag = (q.unsqueeze(2) * sin_k_dot_r.unsqueeze(1)).sum(dim=0)
         s_sq = s_real.square() + s_imag.square()
 
-        return (kfac_flat.unsqueeze(0) * s_sq).sum() / (2.0 * volume)
+        return energy_factor * (kfac_flat.unsqueeze(0) * s_sq).sum() / (2.0 * volume)
 
     def __repr__(self) -> str:
         return (
