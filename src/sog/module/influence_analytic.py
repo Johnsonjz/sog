@@ -81,12 +81,26 @@ def _binom(n: int, k: int) -> float:
 def _build_monomials_for_node(node, xi: float) -> List[Tuple[int, int, int, float]]:
     """Expand CubeS₂ node weight into monomials Σ (px,py,pz,coeff).
 
-    Uses the same geometric convention as C++ fastsog.cpp build_monomials_for_node():
-    η_i = d_i + (1-2d_i)·θ_i for ALL axes (including class-1 special axes).
+    η mapping matches the actual assignment weight `cubes2_weight`:
+      • non-special axes (offset d∈{0,1}): η = θ (d=0) or 1−θ (d=1),
+        i.e. a=d, b=1−2d.
+      • class-1 special axis (offset d∈{−1,2}): η_s = θ (sp_is_neg, d=−1)
+        or 1−θ (d=2), i.e. a=0/b=1 or a=1/b=−1 — NOT a=d,b=1−2d.
+    The special-axis override is essential: using a=d,b=1−2d there gives a
+    slope of ±3 and a wrong window, which collapses the FFT influence
+    function |Φ(k)|² (and hence the reciprocal-space energy).
     """
     dx, dy, dz = node.dx, node.dy, node.dz
     a = [float(dx), float(dy), float(dz)]
     b = [1.0 - 2.0 * ax for ax in a]
+
+    # class-1 special axis uses η_s = θ (d=−1) or 1−θ (d=2), not d + (1−2d)θ.
+    if getattr(node, 'cls', 0) == 1:
+        sp = getattr(node, 'sp_axis', 0)
+        if getattr(node, 'sp_is_neg', 0):
+            a[sp], b[sp] = 0.0, 1.0    # η_s = θ
+        else:
+            a[sp], b[sp] = 1.0, -1.0   # η_s = 1 − θ
 
     xi2 = xi * xi
 

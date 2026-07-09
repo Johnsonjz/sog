@@ -16,7 +16,7 @@ import torch
 
 # ── Optimal ξ parameters ──
 XI_4: float = 1.0 / math.sqrt(3.0)  # ≈ 0.5773502691896258  (C² continuous)
-XI_6: float = 0.6503998              # optimal for CubeS₂ 6th-order (paper Appendix, NOT Table I)
+XI_6: float = 0.6503998764035732   # optimal for CubeS₂ 6th-order (paper SI notebook 2, NOT Table I)
 
 
 def _get_xi(order: int) -> float:
@@ -113,17 +113,16 @@ def _cubes2_R(theta: torch.Tensor, xi: float) -> torch.Tensor:
     return (1.0 / 6.0) * theta**3 + (3.0 * xi2 - 1.0) / 6.0 * theta
 
 
-# ── 6th-order weight sub-functions (degree-5, paper Eq. A9) ──
-# NOTE: Polynomial coefficients need verification against published Appendix.
-# The functional forms (degree-5), node table (88 nodes, 5 classes), weight
-# formula structure (Eq. A10), and optimal xi (0.6503998) are correct.
-# Current coefficients give weight sum ≈ 1/27 instead of 1.
-# TODO: verify L111/L311/L211 coefficients against paper Eq. A9;
-#       then remove the fallback in cubes2_weight() order=6 dispatch.
-_COEFFS_NEED_VERIFICATION = True
-
-# Coefficients below produce correctly-structured but incorrectly-scaled
-# (~1/27×) weights. See midtown-sog.md §7.3 for expected formulas.
+# ── 6th-order weight sub-functions (degree-5, paper Eq. A9 / SI notebook 2) ──
+# VALIDATED: the order-6 weights are numerically correct (sog/verify_order6.py) —
+# moment conditions θ-independent through degree 5, FFT energy converges to the
+# direct k-sum at O(Δ⁶), forces match finite differences.
+#
+# Two subtleties (both verbatim from the paper's SI notebook 2, order-6 block):
+#   • NO overall normalization factor (an earlier ×27 was spurious).
+#   • S is a DISTINCT degree-3 auxiliary (`_cubes2_S_6`), NOT the order-4 L.
+# R is shared with order 4. See papers/cubes2_order6_status.md.
+_COEFFS_NEED_VERIFICATION = False
 
 def _cubes2_L111_6(theta: torch.Tensor, xi: float) -> torch.Tensor:
     """L₁₁₁(θ,ξ) — degree-5 polynomial for 6th-order cls=0 (Eq. A9)."""
@@ -150,6 +149,18 @@ def _cubes2_L211_6(theta: torch.Tensor, xi: float) -> torch.Tensor:
     """L₂₁₁(θ,ξ) = -¼ L₁₁₁ - ⁵⁄₂ L₃₁₁ (Eq. A9)."""
     return (-0.25 * _cubes2_L111_6(theta, xi)
             - 2.5 * _cubes2_L311_6(theta, xi))
+
+
+def _cubes2_S_6(theta: torch.Tensor, xi: float) -> torch.Tensor:
+    """S(θ,ξ) for order-6 CubeS₂ — a degree-3 auxiliary DISTINCT from order-4 L.
+
+    S(θ,ξ) = -½θ³ + ½θ² - (3ξ²-2)/2·θ + ξ²/2   (SI notebook 2, order-6 block).
+
+    NOTE: this is NOT the order-4 `_cubes2_L` (whose θ-term is -(9ξ²-2)/6). Using
+    order-4 L here breaks the order-6 moment conditions at degree ≥2.
+    """
+    xi2 = xi * xi
+    return -0.5 * theta**3 + 0.5 * theta**2 - (3.0 * xi2 - 2.0) / 2.0 * theta + 0.5 * xi2
 
 
 # ── 6th-order node table (88 nodes, D₂ ball with v=3) ──
@@ -234,19 +245,23 @@ def cubes2_weight_6(
 ) -> torch.Tensor:
     """Compute CubeS₂ 6th-order weight for fractional coords (tx,ty,tz) ∈ [0,1).
 
-    5 symmetry classes with degree-5 polynomials (paper Eq. A10).
-    S(θ) = _cubes2_L, R(θ) = _cubes2_R from 4th-order (shared sub-functions).
+    5 symmetry classes with degree-5 polynomials (paper Eq. A10). Verbatim from
+    the paper's SI notebook: R(θ)=`_cubes2_R` is shared with order 4, but the
+    order-6 S(θ)=`_cubes2_S_6` is a DISTINCT degree-3 auxiliary (not order-4 L),
+    and there is NO overall normalization factor.
     """
     # ── cls=0: c₁₁₁ = Σ L111(ηᵢ)ηⱼηₖ + S(η₁)S(η₂)S(η₃)
     if node.cls == 0:
-        eta_x = tx if node.dx == 0 else (1.0 - tx)
-        eta_y = ty if node.dy == 0 else (1.0 - ty)
-        eta_z = tz if node.dz == 0 else (1.0 - tz)
+        # Match the 4th-order convention: the representative node at offset 1
+        # uses η = θ, while reflected nodes at offset 0 use η = 1 - θ.
+        eta_x = tx if node.dx == 1 else (1.0 - tx)
+        eta_y = ty if node.dy == 1 else (1.0 - ty)
+        eta_z = tz if node.dz == 1 else (1.0 - tz)
         return (
             _cubes2_L111_6(eta_x, xi) * eta_y * eta_z
             + _cubes2_L111_6(eta_y, xi) * eta_z * eta_x
             + _cubes2_L111_6(eta_z, xi) * eta_x * eta_y
-            + _cubes2_L(eta_x, xi) * _cubes2_L(eta_y, xi) * _cubes2_L(eta_z, xi)
+            + _cubes2_S_6(eta_x, xi) * _cubes2_S_6(eta_y, xi) * _cubes2_S_6(eta_z, xi)
         )
 
     # ── cls=1: c₂₁₁ = L211(η_sp)η_n1η_n2 + R(η_sp)S(η_n1)S(η_n2)
@@ -254,13 +269,13 @@ def cubes2_weight_6(
         coords = [tx, ty, tz]
         offsets = [node.dx, node.dy, node.dz]
         sp = node.sp_axis
-        eta_s = coords[sp] if node.sp_is_neg else (1.0 - coords[sp])
+        eta_s = (1.0 - coords[sp]) if node.sp_is_neg else coords[sp]
         normal_axes = [a for a in range(3) if a != sp]
-        eta_n1 = coords[normal_axes[0]] if offsets[normal_axes[0]] == 0 else (1.0 - coords[normal_axes[0]])
-        eta_n2 = coords[normal_axes[1]] if offsets[normal_axes[1]] == 0 else (1.0 - coords[normal_axes[1]])
+        eta_n1 = coords[normal_axes[0]] if offsets[normal_axes[0]] == 1 else (1.0 - coords[normal_axes[0]])
+        eta_n2 = coords[normal_axes[1]] if offsets[normal_axes[1]] == 1 else (1.0 - coords[normal_axes[1]])
         return (
             _cubes2_L211_6(eta_s, xi) * eta_n1 * eta_n2
-            + _cubes2_R(eta_s, xi) * _cubes2_L(eta_n1, xi) * _cubes2_L(eta_n2, xi)
+            + _cubes2_R(eta_s, xi) * _cubes2_S_6(eta_n1, xi) * _cubes2_S_6(eta_n2, xi)
         )
 
     # ── cls=2: c₃₁₁ = L311(η_sp)η_n1η_n2
@@ -268,10 +283,10 @@ def cubes2_weight_6(
         coords = [tx, ty, tz]
         offsets = [node.dx, node.dy, node.dz]
         sp = node.sp_axis
-        eta_s = coords[sp] if node.sp_is_neg else (1.0 - coords[sp])
+        eta_s = (1.0 - coords[sp]) if node.sp_is_neg else coords[sp]
         normal_axes = [a for a in range(3) if a != sp]
-        eta_n1 = coords[normal_axes[0]] if offsets[normal_axes[0]] == 0 else (1.0 - coords[normal_axes[0]])
-        eta_n2 = coords[normal_axes[1]] if offsets[normal_axes[1]] == 0 else (1.0 - coords[normal_axes[1]])
+        eta_n1 = coords[normal_axes[0]] if offsets[normal_axes[0]] == 1 else (1.0 - coords[normal_axes[0]])
+        eta_n2 = coords[normal_axes[1]] if offsets[normal_axes[1]] == 1 else (1.0 - coords[normal_axes[1]])
         return _cubes2_L311_6(eta_s, xi) * eta_n1 * eta_n2
 
     # ── cls=3: c₂₂₁ = R(η_sp1)R(η_sp2)S(η_n)
@@ -280,18 +295,18 @@ def cubes2_weight_6(
         offsets = [node.dx, node.dy, node.dz]
         normal_axis = node.sp_axis  # sp_axis = NORMAL axis for cls=3
         special_axes = sorted([a for a in range(3) if a != normal_axis])
-        eta_n = coords[normal_axis] if offsets[normal_axis] == 0 else (1.0 - coords[normal_axis])
-        eta_s1 = coords[special_axes[0]] if bool(node.sp_is_neg & 1) else (1.0 - coords[special_axes[0]])
-        eta_s2 = coords[special_axes[1]] if bool(node.sp_is_neg & 2) else (1.0 - coords[special_axes[1]])
-        return (_cubes2_L(eta_n, xi)
+        eta_n = coords[normal_axis] if offsets[normal_axis] == 1 else (1.0 - coords[normal_axis])
+        eta_s1 = (1.0 - coords[special_axes[0]]) if bool(node.sp_is_neg & 1) else coords[special_axes[0]]
+        eta_s2 = (1.0 - coords[special_axes[1]]) if bool(node.sp_is_neg & 2) else coords[special_axes[1]]
+        return (_cubes2_S_6(eta_n, xi)
                 * _cubes2_R(eta_s1, xi)
                 * _cubes2_R(eta_s2, xi))
 
     # ── cls=4: c₂₂₂ = R(η₁)R(η₂)R(η₃)
     else:  # node.cls == 4
-        eta_x = tx if bool(node.sp_is_neg & 1) else (1.0 - tx)
-        eta_y = ty if bool(node.sp_is_neg & 2) else (1.0 - ty)
-        eta_z = tz if bool(node.sp_is_neg & 4) else (1.0 - tz)
+        eta_x = (1.0 - tx) if bool(node.sp_is_neg & 1) else tx
+        eta_y = (1.0 - ty) if bool(node.sp_is_neg & 2) else ty
+        eta_z = (1.0 - tz) if bool(node.sp_is_neg & 4) else tz
         return (_cubes2_R(eta_x, xi)
                 * _cubes2_R(eta_y, xi)
                 * _cubes2_R(eta_z, xi))
@@ -316,9 +331,13 @@ def cubes2_weight_4(
     """
     if node.cls == 0:
         # Class 0: c_d = L(ηx)·ηy·ηz + L(ηy)·ηz·ηx + L(ηz)·ηx·ηy
-        eta_x = tx if node.dx == 0 else (1.0 - tx)
-        eta_y = ty if node.dy == 0 else (1.0 - ty)
-        eta_z = tz if node.dz == 0 else (1.0 - tz)
+        # η convention (paper Eq. A8 + reflection Eq. 49): the representative
+        # node (1,1,1) uses η=θ, its reflections (offset 0) use η=1−θ.
+        # i.e. η = θ when d==1, η = 1−θ when d==0.  (Using the opposite
+        # mapping mirrors the charge to 1−θ within the cell — a reflection bug.)
+        eta_x = tx if node.dx == 1 else (1.0 - tx)
+        eta_y = ty if node.dy == 1 else (1.0 - ty)
+        eta_z = tz if node.dz == 1 else (1.0 - tz)
         return (
             _cubes2_L(eta_x, xi) * eta_y * eta_z
             + _cubes2_L(eta_y, xi) * eta_z * eta_x
@@ -326,18 +345,20 @@ def cubes2_weight_4(
         )
     else:
         # Class 1: c_d = R(η_special) · η_n1 · η_n2
+        # Representative node (2,1,1): η_special=θ (d=2), η_normal=θ (d=1).
+        # Reflection d=2→d=−1 sends η_special→1−θ (sp_is_neg).
         if node.sp_axis == 0:
-            eta_special = tx if node.sp_is_neg else (1.0 - tx)
-            eta_n1 = ty if node.dy == 0 else (1.0 - ty)
-            eta_n2 = tz if node.dz == 0 else (1.0 - tz)
+            eta_special = (1.0 - tx) if node.sp_is_neg else tx
+            eta_n1 = ty if node.dy == 1 else (1.0 - ty)
+            eta_n2 = tz if node.dz == 1 else (1.0 - tz)
         elif node.sp_axis == 1:
-            eta_special = ty if node.sp_is_neg else (1.0 - ty)
-            eta_n1 = tx if node.dx == 0 else (1.0 - tx)
-            eta_n2 = tz if node.dz == 0 else (1.0 - tz)
+            eta_special = (1.0 - ty) if node.sp_is_neg else ty
+            eta_n1 = tx if node.dx == 1 else (1.0 - tx)
+            eta_n2 = tz if node.dz == 1 else (1.0 - tz)
         else:  # sp_axis == 2
-            eta_special = tz if node.sp_is_neg else (1.0 - tz)
-            eta_n1 = tx if node.dx == 0 else (1.0 - tx)
-            eta_n2 = ty if node.dy == 0 else (1.0 - ty)
+            eta_special = (1.0 - tz) if node.sp_is_neg else tz
+            eta_n1 = tx if node.dx == 1 else (1.0 - tx)
+            eta_n2 = ty if node.dy == 1 else (1.0 - ty)
         return _cubes2_R(eta_special, xi) * eta_n1 * eta_n2
 
 
@@ -351,15 +372,7 @@ def get_nodes(order: int) -> List[CubeS2Node]:
     if order == 4:
         return CUBES2_NODES_4
     if order == 6:
-        import warnings
-        warnings.warn(
-            "6th-order CubeS₂ weight polynomial coefficients need verification "
-            "against paper Appendix Eq. A9. Node table (88 nodes, 5 classes) and "
-            "formula structure (Eq. A10) are correct but produce weights scaled "
-            "~1/27× too small. Falling back to 4th-order weights. "
-            "Grid sizing (φ_max) still uses 6th-order thresholds from Table III."
-        )
-        return CUBES2_NODES_4
+        return CUBES2_NODES_6
     raise ValueError(
         f"Unsupported CubeS₂ order: {order}. Supported: {_SUPPORTED_ORDERS}."
     )
@@ -376,13 +389,15 @@ def cubes2_weight(
     """Compute CubeS₂ weight for the given order.
 
     For 4th-order, uses L(θ)/R(θ) from paper Eqs. 15-16.
-    For 6th-order, uses the same cls==0/cls==1 structure with L6/R6 (TODO).
+    For 6th-order, uses the preliminary degree-5 structure from Eq. A10.
+    The 6th-order implementation is still an initial construction and should be
+    treated as a verification scaffold rather than a final publication-grade
+    formula until the appendix coefficients are cross-checked more thoroughly.
     """
     if order == 4:
         return cubes2_weight_4(tx, ty, tz, node, xi)
     if order == 6:
-        # Polynomial coefficients need verification; use 4th-order weights
-        return cubes2_weight_4(tx, ty, tz, node, xi)
+        return cubes2_weight_6(tx, ty, tz, node, xi)
     raise ValueError(f"Unsupported order: {order}")
 
 

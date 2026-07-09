@@ -197,31 +197,10 @@ def _cubes2_weight_batch(
     """Batched CubeS₂ weight for N atoms.
 
     Works for both scalar tensors (shape []) and batched tensors (shape [N]).
-    Uses the cls==0/cls==1 dispatch matching cubes2_weight_4 / cubes2_weight_6.
+    The implementation routes through the shared spline dispatcher so that
+    order-6 uses the same primitive logic as the scalar path.
     """
-    if node.cls == 0:
-        eta_x = tx if node.dx == 0 else (1.0 - tx)
-        eta_y = ty if node.dy == 0 else (1.0 - ty)
-        eta_z = tz if node.dz == 0 else (1.0 - tz)
-        return (
-            _cubes2_L(eta_x, xi) * eta_y * eta_z
-            + _cubes2_L(eta_y, xi) * eta_z * eta_x
-            + _cubes2_L(eta_z, xi) * eta_x * eta_y
-        )
-    else:
-        if node.sp_axis == 0:
-            eta_s = tx if node.sp_is_neg else (1.0 - tx)
-            eta_n1 = ty if node.dy == 0 else (1.0 - ty)
-            eta_n2 = tz if node.dz == 0 else (1.0 - tz)
-        elif node.sp_axis == 1:
-            eta_s = ty if node.sp_is_neg else (1.0 - ty)
-            eta_n1 = tx if node.dx == 0 else (1.0 - tx)
-            eta_n2 = tz if node.dz == 0 else (1.0 - tz)
-        else:
-            eta_s = tz if node.sp_is_neg else (1.0 - tz)
-            eta_n1 = tx if node.dx == 0 else (1.0 - tx)
-            eta_n2 = ty if node.dy == 0 else (1.0 - ty)
-        return _cubes2_R(eta_s, xi) * eta_n1 * eta_n2
+    return cubes2_weight(tx, ty, tz, node, xi, order=order)
 
 
 # ── Influence function: |Φ(k)|² via FFT of window on grid ──
@@ -697,13 +676,19 @@ class Cubes2FFTFunction(torch.autograd.Function):
         kfac_fft[0, 0, 0] = 0.0
         kfac_fft = kfac_fft.masked_fill(k_sq > k_sq_max, 0.0)
 
-        # ── Influence function + Green function (analytic, matching C++ FastSOG) ──
-        with torch.no_grad():
-            influence_sq = precompute_influence_analytic(
-                nx, ny, nz, lx, ly, lz, xi=xi, device=device, dtype=torch.float64,
-            ).to(dtype=dtype)
-
-        green_k = kfac_fft / influence_sq.clamp(min=1e-20)
+        # ── Green function via analytic variance-subtraction (paper Eq. 70) ──
+        # G(k) = K(k²)·exp(+Σ_α σ_{s,α}² k_α²), σ_{s,α}=ξ₀·Δ_α. No division by
+        # the spline influence (unstable for non-convolutional CubeS₂).
+        sig_sx2 = (xi * lx / nx) ** 2
+        sig_sy2 = (xi * ly / ny) ** 2
+        sig_sz2 = (xi * lz / nz) ** 2
+        kx2_p = (KX_phys ** 2).permute(2, 1, 0)
+        ky2_p = (KY_phys ** 2).permute(2, 1, 0)
+        kz2_p = (KZ_phys ** 2).permute(2, 1, 0)
+        deconv = torch.exp(sig_sx2 * kx2_p + sig_sy2 * ky2_p + sig_sz2 * kz2_p)
+        green_k = kfac_fft * deconv
+        green_k[0, 0, 0] = 0.0
+        green_k = green_k.masked_fill(k_sq > k_sq_max, 0.0)
         volume = volume_val
         N3 = float(nx * ny * nz)
         s2 = 1.0 / (N3 * N3)
@@ -715,9 +700,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
             _rfft_w[:, :, 1:] = 2.0
         diag_sum_fft = (_rfft_w * kfac_fft).sum() / (2.0 * volume)
 
-        # ── Spread + FFT + Energy (C++ convention: rho_scale=N/V) ──
-        # With rho_scale=N/V in spreading: ρ(k) ∝ (N/V)·S(k)·Φ(k)
-        # E = V/(2N²)·Σ w·K/|Φ|²·|ρ|² = (1/2V)·Σ w·K·|S|²  (Φ cancels exactly)
+        # ── Spread + FFT + Energy (rho_scale=N/V; σ_s² cancels) ──
         rho_grid = cubes2_spread(q, r_frac, nx, ny, nz, xi=xi, order=order,
                                   rho_scale=float(nx*ny*nz)/volume)
         rho_k = torch.fft.rfftn(rho_grid)
@@ -748,7 +731,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
         ctx.self_coeff = self_coeff
         ctx.diag_sum_fft = diag_sum_fft
         # ── Save for amp/bw gradient computation ──
-        ctx.influence_sq = influence_sq.detach()      # |Φ(k)|²
+        ctx.deconv = deconv.detach()                  # exp(+Σ σ_{s,α}² k_α²)
         ctx.k_sq = k_sq                                # k² grid
         ctx.k_sq_max = k_sq_max                        # Nyquist cutoff
         ctx._rfft_w = _rfft_w                          # rfftn weight
@@ -773,6 +756,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
         volume = ctx.volume
         norm_factor = ctx.norm_factor
         xi = ctx.xi
+        order = ctx.order
 
         dtype = green_k.dtype
         device = green_k.device
@@ -802,7 +786,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
         ).to(dtype=dtype)
 
         explicit_force = cubes2_interpolate(
-            q, r_frac, force_grid, nx, ny, nz, xi=xi,
+            q, r_frac, force_grid, nx, ny, nz, xi=xi, order=order,
         )
         explicit_force = explicit_force * N3 * norm_factor
 
@@ -810,7 +794,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
         phi_k = conv_k
         phi_grid = torch.fft.irfftn(phi_k, s=(nz, ny, nx)).to(dtype=dtype)
         potential = cubes2_interpolate_potential(
-            r_frac, phi_grid, nx, ny, nz, xi=xi,
+            r_frac, phi_grid, nx, ny, nz, xi=xi, order=order,
         )
         grad_q = potential * N3 * norm_factor
 
@@ -828,8 +812,9 @@ class Cubes2FFTFunction(torch.autograd.Function):
 
         # ── amp / bandwidth gradients: kernel parameter optimization ──
         # ∂E/∂amp[m] = ½·V/N⁶·Σ w·exp(-½·bw[m]·k²)/|Φ|²·|ρ|²
+        # ∂E/∂amp[m] = ½·V/N⁶·Σ w·exp(-½·bw[m]·k²)·deconv·|ρ|²
         #               - Q²·Σ w·exp(-½·bw[m]·k²)/(2V)  (if remove_self_interaction)
-        # ∂E/∂bw[m]  = ½·V/N⁶·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]/|Φ|²·|ρ|²
+        # ∂E/∂bw[m]  = ½·V/N⁶·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]·deconv·|ρ|²
         #               - Q²·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]/(2V)  (if remove_self_interaction)
         grad_amp = None
         grad_bw2 = None
@@ -839,7 +824,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
             bw2_bw = ctx.bw2_d
             M = amp_bw.shape[0]
             k_sq_bw = ctx.k_sq
-            inv_phi2 = 1.0 / ctx.influence_sq.clamp(min=1e-20)
+            deconv = ctx.deconv  # exp(+Σ σ_{s,α}² k_α²), replaces 1/|Φ|²
 
             prefactor_main = 0.5 * ctx.volume * ctx.s2_val  # ½·V/N⁶
             prefactor_diag = 1.0 / (2.0 * ctx.volume)         # 1/(2V)
@@ -854,8 +839,8 @@ class Cubes2FFTFunction(torch.autograd.Function):
             exp_all = torch.exp(-0.5 * bw2_4d * k_sq_4d)    # [M, nz, ny, nx//2+1]
             exp_all = exp_all.masked_fill(~k_mask.unsqueeze(0), 0.0)
 
-            # weighted = _rfft_w * exp * inv_phi2 * rho_sq    [M, nz, ny, nx//2+1]
-            weighted = ctx._rfft_w * exp_all * inv_phi2 * ctx.rho_sq
+            # weighted = _rfft_w * exp * deconv * rho_sq    [M, nz, ny, nx//2+1]
+            weighted = ctx._rfft_w * exp_all * deconv * ctx.rho_sq
 
             if ctx.needs_input_grad[3]:
                 grad_amp = prefactor_main * weighted.sum(dim=(1, 2, 3))  # [M]
@@ -983,13 +968,23 @@ def compute_cubes2_fft(
     # k_sq_max mask: grid Nyquist for φ-based, (2π/n_dl)² for legacy n_dl
     kfac_fft = kfac_fft.masked_fill(k_sq > k_sq_max, 0.0)
 
-    # ── Influence function + Green function (analytic, matching C++ FastSOG) ──
-    with torch.no_grad():
-        influence_sq = precompute_influence_analytic(
-            nx, ny, nz, lx, ly, lz, xi=xi, device=device, dtype=torch.float64,
-        ).to(dtype=dtype)
-
-    green_k = kfac_fft / influence_sq.clamp(min=1e-20)
+    # ── Green function via analytic variance-subtraction (paper Eq. 70) ──
+    # CubeS₂ spreading approximates an ideal Gaussian of variance σ_s²=(ξ₀Δ)²
+    # per axis; the deconvolution is analytic: G(k)=K(k²)·exp(+Σ_α σ_{s,α}² k_α²)
+    # = Σ_m amp_m exp(-½(bw_m − 2σ_s²)k²) (isotropic grid). No division by the
+    # spline influence → stable, O(Δ^{2ν}) accurate, matches the direct k-sum.
+    # (The SPME-division form K/|Φ|² is unstable for the non-convolutional CubeS₂
+    #  window and is not used.)
+    sig_sx2 = (xi * lx / nx) ** 2
+    sig_sy2 = (xi * ly / ny) ** 2
+    sig_sz2 = (xi * lz / nz) ** 2
+    kx2_p = (KX2 ** 2).permute(2, 1, 0)
+    ky2_p = (KY2 ** 2).permute(2, 1, 0)
+    kz2_p = (KZ2 ** 2).permute(2, 1, 0)
+    deconv = torch.exp(sig_sx2 * kx2_p + sig_sy2 * ky2_p + sig_sz2 * kz2_p)
+    green_k = kfac_fft * deconv
+    green_k[0, 0, 0] = 0.0
+    green_k = green_k.masked_fill(k_sq > k_sq_max, 0.0)
 
     # rfftn weight: mx>0 modes represent both +k_x and -k_x.
     _rfft_w2 = torch.ones(1, 1, nx // 2 + 1, dtype=dtype, device=device)
@@ -1007,9 +1002,10 @@ def compute_cubes2_fft(
     # Self-interaction: Σ K(k²) / (2V) over k≠0
     diag_sum_fft = (_rfft_w2 * kfac_fft).sum() / (2.0 * volume_val)
 
-    # ── Spread + FFT + Energy (C++ convention: rho_scale=N/V) ──
-    # With rho_scale=N/V in spreading: ρ(k) ∝ (N/V)·S(k)·Φ(k)
-    # E = V/(2N²)·Σ w·K/|Φ|²·|ρ|² = (1/2V)·Σ w·K·|S|²  (Φ cancels exactly)
+    # ── Spread + FFT + Energy (rho_scale=N/V) ──
+    # ρ(k) ≈ (N/V)·S(k)·exp(-½σ_s²k²) (CubeS₂ ≈ Gaussian spread). With the
+    # variance-subtraction Green function G=K·exp(+σ_s²k²), the σ_s² factors
+    # cancel: E = V/(2N²)·Σ w·G·|ρ|² = (1/2V)·Σ w·K·|S|².
     rho_grid = cubes2_spread(q, r_frac, nx, ny, nz, xi=xi, order=order,
                               rho_scale=N3_val/volume_val)
     rho_k = torch.fft.rfftn(rho_grid)
