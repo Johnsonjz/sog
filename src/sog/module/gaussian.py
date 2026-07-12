@@ -84,6 +84,8 @@ class Gaussian(nn.Module):
           detected and ``trainable=False``.
     """
 
+    _diag_count = 0  # per-process step counter for gate tracing
+
     def __init__(
         self,
         n_dl: Optional[float] = None,
@@ -373,9 +375,83 @@ class Gaussian(nn.Module):
 
         explicit_all = True
 
-        for bid_t in torch.unique(batch):
-            bid = int(bid_t.item())
-            mask = batch == bid_t
+        # ── Precompute per-frame scalars ONCE per batch (not per frame) to avoid the
+        #    ~6 GPU→CPU syncs/frame that dominate the direct k-sum for small systems
+        #    (bid.item, box_hash.tolist, 3× nk.item, bandwidth.min.item, volume>eps).
+        #    The k-sum FLOPs are trivial; the per-frame sync/launch overhead is not. ──
+        bids_py = torch.unique(batch).tolist()
+        _direct_mode = (
+            cell is not None
+            and not self.use_cubes2_fft
+            and not (self.use_nufft and HAS_PYTORCH_FINUFFT)
+        )
+        vols_all = None
+        periodic_py = None
+        n_dl_direct = None
+        nk_by_frame = None
+        if cell is not None:
+            vols_all = torch.abs(torch.det(cell))  # [nf], differentiable (for autograd virial)
+            periodic_py = (vols_all > torch.finfo(cell.dtype).eps).tolist()
+            if _direct_mode:
+                n_dl_direct = self._resolve_direct_n_dl(cell.dtype, cell.device)
+                nk_all = (
+                    torch.norm(cell, dim=2) / n_dl_direct
+                ).to(torch.int64).clamp(min=1)
+                nk_by_frame = nk_all.tolist()  # [nf][3]
+
+        # ── Fast batched direct k-sum: uniform nloc + uniform nk + canonical batch ──
+        # Collapses the per-frame Python loop (dozens of tiny kernel launches × nf)
+        # into single batched ops. Energy only; forces/virial via autograd exactly as
+        # in the loop path. Falls through to the loop for ragged/mixed-nk batches.
+        #
+        # ── diagnostic gate tracer (SOG_DIAG=1 to enable) ──
+        _diag = getattr(Gaussian, "_diag_count", 0)
+        _print_diag = _diag < 3 and __import__("os").environ.get("SOG_DIAG", "") == "1"
+        Gaussian._diag_count = _diag + 1
+        if (
+            _direct_mode
+            and getattr(self, "_enable_batched_direct", True)
+            and nk_by_frame is not None
+            and len(bids_py) > 0
+            and all(periodic_py)
+        ):
+            nf_b = len(bids_py)
+            nk0 = nk_by_frame[0]
+            n_total = r.shape[0]
+            _nk_ok = all(nkf == nk0 for nkf in nk_by_frame)
+            _nloc_ok = n_total % nf_b == 0
+            # ── nk-relaxed batched path: use max nk across frames for the shared k-grid.
+            #     Frames with smaller nk get extra zero-masked modes (the mode_mask
+            #     is computed per-frame and zeros out |k|>k_max). This handles ±2% NPT
+            #     box fluctuations without falling through to the per-frame loop.
+            _nk_max = tuple(int(max(nkf[i] for nkf in nk_by_frame)) for i in range(3))
+            if _print_diag:
+                print(f"[SOG-DIAG] batched gate: _direct_mode={_direct_mode} nf={nf_b} "
+                      f"nk_by_frame={nk_by_frame} nk_ok={_nk_ok} nloc_ok={_nloc_ok} "
+                      f"nk_max={_nk_max} ntot={n_total} nloc_bat={n_total//nf_b if _nloc_ok else '??'}")
+            if _nloc_ok:
+                nloc_b = n_total // nf_b
+                canonical = torch.equal(
+                    batch,
+                    torch.arange(
+                        nf_b, device=batch.device, dtype=batch.dtype
+                    ).repeat_interleave(nloc_b),
+                )
+                if canonical:
+                    energy_batched = self._compute_bundle_direct_batched(
+                        q, r, cell, nf_b, nloc_b,
+                        _nk_max,
+                        float(n_dl_direct),
+                    )
+                    return {
+                        "energy": energy_batched,
+                        "forces": None,
+                        "virial": None,
+                        "used_explicit_derivatives": False,
+                    }
+
+        for bid in bids_py:
+            mask = batch == bid
             r_now = r[mask]
             q_now = q[mask]
 
@@ -387,8 +463,8 @@ class Gaussian(nn.Module):
             volume = None
             if cell is not None:
                 box_now = cell[bid]
-                volume = torch.abs(torch.det(box_now))
-                periodic = volume > torch.finfo(box_now.dtype).eps
+                volume = vols_all[bid]
+                periodic = bool(periodic_py[bid])
 
             if periodic and self.use_cubes2_fft:
                 # ── CubeS₂ + PyTorch FFT path (autograd-compatible) ──
@@ -561,7 +637,14 @@ class Gaussian(nn.Module):
 
                 if periodic:
                     assert box_now is not None
-                    pot_now = self.compute_potential_triclinic(r_now, q_now, box_now, _volume=volume)
+                    _nk_ov = (
+                        tuple(nk_by_frame[bid]) if nk_by_frame is not None else None
+                    )
+                    pot_now = self.compute_potential_triclinic(
+                        r_now, q_now, box_now, _volume=volume,
+                        n_dl_override=n_dl_direct, nk_override=_nk_ov,
+                        use_direct_cache=False,
+                    )
                 else:
                     pot_now = self.compute_potential_realspace(r_now, q_now)
 
@@ -664,17 +747,37 @@ class Gaussian(nn.Module):
 
         return pot * self.norm_factor
 
+    def _resolve_direct_n_dl(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> float:
+        """Direct-k-sum ``n_dl``, computed ONCE per batch (it is constant across
+        frames — depends only on the kernel bandwidths, not the box). Returns
+        ``self.n_dl`` if set, else the accuracy-derived value from the narrowest
+        Gaussian. Replaces a per-frame ``bandwidth.min().item()`` sync with one."""
+        if self.n_dl is not None:
+            return float(self.n_dl)
+        bw_min = self.bandwidth.to(dtype=dtype, device=device).min().item()
+        _eps = 1e-5
+        _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
+        return 2.0 * math.pi / max(_kmax, 1e-30)
+
     def compute_potential_triclinic(
         self,
         r_raw: torch.Tensor,
         q: torch.Tensor,
         cell_now: torch.Tensor,
         _volume: Optional[torch.Tensor] = None,
+        n_dl_override: Optional[float] = None,
+        nk_override: Optional[Tuple[int, int, int]] = None,
+        use_direct_cache: bool = True,
     ) -> torch.Tensor:
         state = self._prepare_triclinic_state(
             r_raw, q, cell_now, _volume=_volume,
             compute_r_in=self.use_nufft and HAS_PYTORCH_FINUFFT,
             prefilter=not (self.use_nufft and HAS_PYTORCH_FINUFFT),
+            n_dl_override=n_dl_override,
+            nk_override=nk_override,
+            use_direct_cache=use_direct_cache,
         )
 
         if self.use_nufft and HAS_PYTORCH_FINUFFT:
@@ -712,6 +815,9 @@ class Gaussian(nn.Module):
         compute_r_in: bool = True,
         _volume: Optional[torch.Tensor] = None,
         prefilter: bool = False,
+        n_dl_override: Optional[float] = None,
+        nk_override: Optional[Tuple[int, int, int]] = None,
+        use_direct_cache: bool = True,
     ) -> Dict[str, torch.Tensor | Tuple[int, int, int]]:
         """Prepare triclinic state for periodic computations.
 
@@ -774,19 +880,31 @@ class Gaussian(nn.Module):
             }
 
         # Auto-compute n_dl from accuracy when not set (direct k-space path).
-        _n_dl = self.n_dl
-        if _n_dl is None:
-            bw_min = self.bandwidth.to(dtype=real_dtype, device=runtime_device).min().item()
-            # ε = 1e-5: n_dl = 2π / sqrt(2·ln(1/ε) / bw_min)
-            _eps = 1e-5
-            _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
-            _n_dl = 2.0 * math.pi / max(_kmax, 1e-30)
+        # n_dl_override (precomputed once per batch by the caller) skips the per-frame
+        # bandwidth.min().item() GPU→CPU sync.
+        if n_dl_override is not None:
+            _n_dl = n_dl_override
+        else:
+            _n_dl = self.n_dl
+            if _n_dl is None:
+                bw_min = self.bandwidth.to(dtype=real_dtype, device=runtime_device).min().item()
+                # ε = 1e-5: n_dl = 2π / sqrt(2·ln(1/ε) / bw_min)
+                _eps = 1e-5
+                _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
+                _n_dl = 2.0 * math.pi / max(_kmax, 1e-30)
 
-        norms = torch.norm(box, dim=1)
-        nk = tuple(max(1, int(v.item() / _n_dl)) for v in norms)
+        # nk_override (precomputed once per batch) skips 3 per-frame v.item() syncs.
+        if nk_override is not None:
+            nk = nk_override
+        else:
+            norms = torch.norm(box, dim=1)
+            nk = tuple(max(1, int(v.item() / _n_dl)) for v in norms)
 
         # ── Direct-path cache: skip g_cart/kfac/diag_sum when box is unchanged ──
-        if prefilter:
+        # Disabled (use_direct_cache=False) for multi-frame training batches, where
+        # every frame has a distinct box so the cache never hits and the box_hash
+        # .tolist() is a pure per-frame sync.
+        if prefilter and use_direct_cache:
             box_hash = tuple(
                 float(x)
                 for x in box.detach().reshape(-1).mul(1e6).round().div(1e6).tolist()
@@ -837,12 +955,13 @@ class Gaussian(nn.Module):
             k_sq_flat = k_sq.reshape(-1)[mask_flat]                   # [K]
             kfac_out = (amp * torch.exp(-0.5 * bw2 * k_sq_flat.unsqueeze(-1))).sum(dim=-1)  # [K]
             diag_sum = kfac_out.sum() / (2.0 * volume)
-            # Cache for future frames with the same box.
-            self._direct_state_cache[cache_key] = (
-                g_cart_out.detach(), kfac_out.detach(), diag_sum.detach())
-            if len(self._direct_state_cache) > self._max_cache_size:
-                oldest = next(iter(self._direct_state_cache.keys()))
-                self._direct_state_cache.pop(oldest, None)
+            # Cache for future frames with the same box (when enabled).
+            if use_direct_cache:
+                self._direct_state_cache[cache_key] = (
+                    g_cart_out.detach(), kfac_out.detach(), diag_sum.detach())
+                if len(self._direct_state_cache) > self._max_cache_size:
+                    oldest = next(iter(self._direct_state_cache.keys()))
+                    self._direct_state_cache.pop(oldest, None)
         else:
             # NUFFT path / legacy: full 3D grid with masked_fill.
             amp_3d = amp.view(1, 1, 1, -1)
@@ -961,6 +1080,94 @@ class Gaussian(nn.Module):
 
         return energy, force, virial
 
+    def _compute_bundle_direct_batched(
+        self,
+        q: torch.Tensor,
+        r: torch.Tensor,
+        cell: torch.Tensor,
+        nf: int,
+        nloc: int,
+        nk: Tuple[int, int, int],
+        n_dl: float,
+    ) -> torch.Tensor:
+        """Batched direct k-sum over uniform-nloc, uniform-nk frames → per-frame
+        energy [nf]. Collapses the per-frame Python loop (dozens of tiny kernel
+        launches × nf) into single batched ops — the dominant cost for small
+        systems is launch overhead, not FLOPs. Bit-matches the per-frame loop
+        (compute_potential_triclinic + the k=0 correction). Differentiable w.r.t.
+        r and cell, so forces/virial (incl. the charge-response) come from autograd,
+        exactly as in the loop path (explicit_all=False)."""
+        device = r.device
+        dtype = r.dtype
+        two_pi = 2.0 * math.pi
+
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        nch = q.shape[1]
+        r_f = q.new_zeros(0)  # placeholder for type checkers
+        r_f = r.view(nf, nloc, 3)
+        q_f = q.view(nf, nloc, nch)
+
+        volume = torch.abs(torch.det(cell))          # [nf], differentiable
+        inv2v = 1.0 / (2.0 * volume)                 # [nf]
+        cell_inv = torch.linalg.inv(cell)            # [nf,3,3]
+
+        k_grid_int, zero_mask, _ = self._get_cached_kgrid_base(nk, device, dtype)
+        k_int = k_grid_int.reshape(3, -1)            # [3, G]
+        zero_flat = zero_mask.reshape(-1)            # [G]
+
+        g_cart = two_pi * torch.einsum("fik,kG->fiG", cell_inv, k_int)  # [nf,3,G]
+        k_sq = (g_cart * g_cart).sum(dim=1)          # [nf,G]
+        k_sq_max = (two_pi / n_dl) ** 2
+        mode_mask = (~zero_flat).unsqueeze(0) & (k_sq <= k_sq_max)      # [nf,G]
+
+        amp = self.amp.to(dtype=dtype, device=device).view(1, 1, -1)    # [1,1,M]
+        bw2 = self.bandwidth.to(dtype=dtype, device=device).view(1, 1, -1)
+        kfac = (amp * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))).sum(dim=-1)  # [nf,G]
+        kfac = kfac.masked_fill(~mode_mask, 0.0)
+
+        # structure factor S(k) per frame/channel
+        k_dot_r = torch.einsum("fnd,fdG->fnG", r_f, g_cart)            # [nf,nloc,G]
+        cos_kr = torch.cos(k_dot_r)
+        sin_kr = torch.sin(k_dot_r)
+        s_real = torch.einsum("fnc,fnG->fcG", q_f, cos_kr)            # [nf,nch,G]
+        s_imag = torch.einsum("fnc,fnG->fcG", q_f, sin_kr)
+        s_sq = s_real.square() + s_imag.square()                      # [nf,nch,G]
+
+        # full-grid reciprocal sum (factor 1) == loop's half-sphere × 2
+        e_recip = (kfac.unsqueeze(1) * s_sq).sum(dim=(1, 2)) * inv2v   # [nf]
+        diag_sum = kfac.sum(dim=1) * inv2v                            # [nf]
+        q_sq_sum = (q_f * q_f).sum(dim=(1, 2))                        # [nf]
+
+        pot = e_recip
+        if self.remove_self_interaction:
+            pot = pot - q_sq_sum * diag_sum
+        if self.self_coeff != 0.0:
+            pot = pot - q_sq_sum * self.self_coeff
+        pot = pot * self.norm_factor
+
+        # ── physical k=0 correction (regularized k_min from reciprocal lattice) ──
+        a1, a2, a3 = cell[:, 0], cell[:, 1], cell[:, 2]
+        vol_c = volume.unsqueeze(1)
+        b1 = two_pi * torch.linalg.cross(a2, a3, dim=1) / vol_c
+        b2 = two_pi * torch.linalg.cross(a3, a1, dim=1) / vol_c
+        b3 = two_pi * torch.linalg.cross(a1, a2, dim=1) / vol_c
+        k_min_sq = torch.stack(
+            [(b1 * b1).sum(1), (b2 * b2).sum(1), (b3 * b3).sum(1)], dim=1
+        ).min(dim=1).values                                          # [nf]
+        amp0 = self.amp.to(dtype=dtype, device=device).view(1, -1)
+        bw0 = self.bandwidth.to(dtype=dtype, device=device).view(1, -1)
+        kfac_eff = (amp0 * torch.exp(-0.5 * bw0 * k_min_sq.unsqueeze(1))).sum(dim=1)  # [nf]
+        q_sum = q_f.sum(dim=(1, 2))                                   # [nf]
+        pot = pot + kfac_eff * q_sum.square() * inv2v * self.norm_factor
+        if self.remove_self_interaction:
+            pot = pot - kfac_eff * q_sq_sum * inv2v * self.norm_factor
+        if self.charge_neutral_lambda is not None and self.charge_neutral_lambda > 0:
+            pot = pot + float(self.charge_neutral_lambda) * (
+                q_f.mean(dim=1) ** 2
+            ).sum(dim=1)
+        return pot  # [nf]
+
     def _compute_periodic_direct(
         self,
         r_raw: torch.Tensor,
@@ -1012,8 +1219,9 @@ class Gaussian(nn.Module):
         cos_k_dot_r = torch.cos(k_dot_r)
         sin_k_dot_r = torch.sin(k_dot_r)
 
-        s_real = (q.unsqueeze(2) * cos_k_dot_r.unsqueeze(1)).sum(dim=0)
-        s_imag = (q.unsqueeze(2) * sin_k_dot_r.unsqueeze(1)).sum(dim=0)
+        # matmul structure factor: q.T @ cos  → [C,K] instead of broadcast [N,C,K]
+        s_real = torch.matmul(q.transpose(0, 1).to(cos_k_dot_r.dtype), cos_k_dot_r)
+        s_imag = torch.matmul(q.transpose(0, 1).to(sin_k_dot_r.dtype), sin_k_dot_r)
         s_sq = s_real.square() + s_imag.square()
 
         return energy_factor * (kfac_flat.unsqueeze(0) * s_sq).sum() / (2.0 * volume)
