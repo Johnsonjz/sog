@@ -80,6 +80,8 @@ class Sog(nn.Module):
             kernel_param_mode=self.kernel_param_mode,
             kernel_tensor_mode=self.kernel_tensor_mode,
             use_cubes2_fft=self.use_cubes2_fft,
+            use_quads_fft=self.use_quads_fft,
+            quads_order=self.quads_order,
         )
 
         self.bec = BEC(
@@ -108,6 +110,7 @@ class Sog(nn.Module):
                     "`n_dl` to auto-default from Predescu 2020 Table III."
                 )
         self.cubes2_order = int(args.get("cubes2_order", 4))
+        self.quads_order = int(args.get("quads_order", 6))
         self.amp = args.get("amp", None)
         self.bandwidth = args.get("bandwidth", None)
 
@@ -165,6 +168,7 @@ class Sog(nn.Module):
         r_cut_arg = args.get("r_cut", args.get("rcut", None))
         self.r_cut = float(r_cut_arg) if r_cut_arg is not None else None
         self.use_cubes2_fft = bool(args.get("use_cubes2_fft", False))
+        self.use_quads_fft = bool(args.get("use_quads_fft", False))
         self.nlayers = int(args.get("nlayers", 1))
         if self.r_cut is not None:
             if self.r_cut <= 0.0:

@@ -869,8 +869,59 @@ class Cubes2FFTFunction(torch.autograd.Function):
                 None, None, None, None)
 
 
-# ── Main FFT solver ──
+# ── Reciprocal-space virial (energy + self-energy strain derivatives) ──
 
+def mesh_reciprocal_virial(
+    rho_sq: torch.Tensor,           # |ρ̂(k)|² on rfft grid [nz,ny,nx//2+1]
+    green_energy: torch.Tensor,     # g_E = K(k²)·D  (or K/|Ŵ|²) [nz,ny,nx//2+1]
+    green_virial: torch.Tensor,     # g_V = K_v(k²)·D (or K_v/|Ŵ|²)
+    kfac: torch.Tensor,             # K(k²) = Σ amp·exp(-½bw·k²)  (no deconv, for self term)
+    kfacv: torch.Tensor,            # K_v(k²) = Σ amp·bw·exp(-½bw·k²)
+    KXr: torch.Tensor, KYr: torch.Tensor, KZr: torch.Tensor,   # real k-vectors [nz,ny,nx//2+1]
+    rfft_w: torch.Tensor,           # rfftn mirror weight [1,1,nx//2+1]
+    vol: float, s2: float, norm_factor: float, qsq: float,
+    remove_self_interaction: bool,
+) -> torch.Tensor:
+    """Reciprocal virial W = −∂E/∂ε (3×3), matching the direct k-sum stress.
+
+    W_αβ = C·Σ w·|ρ̂|²·(g_E δ_αβ − g_V k_α k_β)                          [reciprocal sum]
+         + q²·norm·(Σ w·K_v·k_α k_β/(2V) − δ_αβ·Σ w·K/(2V))            [self-energy ∂/∂ε]
+    with C = norm·½·V·s2. The second line is the k=0/self strain-derivative that the
+    production formula (sog.cpp:1976-1993) DROPS — it is what closes the ~2.5%→~0.5% gap
+    (and makes the off-diagonal shear exact), for BOTH CubeS₂ and QuadS.
+    """
+    dev, dt = rho_sq.device, rho_sq.dtype
+    wr = rfft_w * rho_sq
+    pref = norm_factor * 0.5 * vol * s2
+    diag = pref * (wr * green_energy).sum()
+
+    def comp(Ka, Kb):
+        return pref * (wr * green_virial * Ka * Kb).sum()
+
+    W = torch.zeros(3, 3, device=dev, dtype=dt)
+    W[0, 0] = diag - comp(KXr, KXr); W[1, 1] = diag - comp(KYr, KYr); W[2, 2] = diag - comp(KZr, KZr)
+    W[0, 1] = W[1, 0] = -comp(KXr, KYr)
+    W[0, 2] = W[2, 0] = -comp(KXr, KZr)
+    W[1, 2] = W[2, 1] = -comp(KYr, KZr)
+
+    if remove_self_interaction:
+        ds = (rfft_w * kfac).sum() / (2.0 * vol)          # diag_sum
+        pv = qsq * norm_factor / (2.0 * vol)
+
+        def scomp(Ka, Kb):
+            return pv * (rfft_w * kfacv * Ka * Kb).sum()
+
+        off = qsq * norm_factor * ds
+        W[0, 0] = W[0, 0] + scomp(KXr, KXr) - off
+        W[1, 1] = W[1, 1] + scomp(KYr, KYr) - off
+        W[2, 2] = W[2, 2] + scomp(KZr, KZr) - off
+        W[0, 1] = W[1, 0] = W[0, 1] + scomp(KXr, KYr)
+        W[0, 2] = W[2, 0] = W[0, 2] + scomp(KXr, KZr)
+        W[1, 2] = W[2, 1] = W[1, 2] + scomp(KYr, KZr)
+    return W
+
+
+# ── Main FFT solver ──
 def compute_cubes2_fft(
     q: torch.Tensor,
     r: torch.Tensor,
@@ -1050,7 +1101,17 @@ def compute_cubes2_fft(
         result["forces"] = force
 
         if compute_virial:
-            result["virial"] = torch.einsum("ni,nj->ij", force, r)
+            kfacv_fft = (amp_dev.view(1, 1, 1, -1) * bw2_dev.view(1, 1, 1, -1)
+                         * torch.exp(-0.5 * bw2_dev.view(1, 1, 1, -1) * k_sq.unsqueeze(-1))).sum(dim=-1)
+            kfacv_fft[0, 0, 0] = 0.0
+            kfacv_fft = kfacv_fft.masked_fill(k_sq > k_sq_max, 0.0)
+            green_virial = (kfacv_fft * deconv).masked_fill(k_sq > k_sq_max, 0.0)
+            green_virial[0, 0, 0] = 0.0
+            result["virial"] = mesh_reciprocal_virial(
+                rho_sq, green_k, green_virial, kfac_fft, kfacv_fft,
+                KX2.permute(2, 1, 0), KY2.permute(2, 1, 0), KZ2.permute(2, 1, 0),
+                _rfft_w2, volume_val, s2_val, norm_factor, float((q * q).sum()),
+                remove_self_interaction)
 
     # ── ∂E/∂q: potential at atoms via G·ρ/V → irfftn → interpolate ──
     if compute_dq:

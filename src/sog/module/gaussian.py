@@ -107,6 +107,8 @@ class Gaussian(nn.Module):
         use_cubes2_fft: bool = False,
         cubes2_phi_max: Optional[float] = None,
         cubes2_order: int = 4,
+        use_quads_fft: bool = False,
+        quads_order: int = 6,
         **_kwargs: Any,
     ):
         super().__init__()
@@ -256,6 +258,8 @@ class Gaussian(nn.Module):
         self.use_cubes2_fft = bool(use_cubes2_fft)
         self.cubes2_phi_max = float(cubes2_phi_max) if cubes2_phi_max is not None else None
         self.cubes2_order = int(cubes2_order)
+        self.use_quads_fft = bool(use_quads_fft)
+        self.quads_order = int(quads_order)
         self.rcut = float(rcut) if rcut is not None else None
         self.b = float(b)
 
@@ -471,6 +475,56 @@ class Gaussian(nn.Module):
                         pot_now += e_ch
 
                 # Sum forces and virial over channels
+                if f_ch_list:
+                    force_full[mask] = torch.stack(f_ch_list, dim=0).sum(dim=0)
+                if v_ch_list:
+                    virial_list.append(torch.stack(v_ch_list, dim=0).sum(dim=0))
+
+            elif periodic and self.use_quads_fft:
+                # ── QuadS (separable quadrature spline) + PyTorch FFT path ──
+                # Exact separable influence (Form A), better energy/force than CubeS₂;
+                # explicit-force path (autograd through the spread floor is truncated, so
+                # forces are taken explicitly, like the CubeS₂ force branch).
+                from .quads_fft import compute_quads_fft as _quads_fft
+
+                assert box_now is not None
+                nq_local = q_now.shape[1] if q_now.dim() > 1 else 1
+                pot_now = 0.0
+                f_ch_list = []
+                v_ch_list = []
+                for ch in range(nq_local):
+                    q_ch = q_now[:, ch] if nq_local > 1 else q_now.reshape(-1)
+                    state = self._prepare_triclinic_state(
+                        r_now, q_ch.reshape(-1), box_now, compute_spectral=False,
+                        compute_r_in=False, _volume=volume,
+                    )
+                    result = _quads_fft(
+                        q=state["q"].reshape(-1),
+                        r=state["r_raw"],
+                        cell=box_now,
+                        amp=self.amp,
+                        bw2=self.bandwidth,
+                        volume=state["volume"],
+                        diag_sum=state["diag_sum"],
+                        cubes2_phi_max=self.cubes2_phi_max,
+                        n_dl=self.n_dl if self.cubes2_phi_max is None else None,
+                        r_c=self.rcut,
+                        b=self.b,
+                        order=self.quads_order,
+                        remove_self_interaction=self.remove_self_interaction,
+                        self_coeff=self.self_coeff,
+                        norm_factor=self.norm_factor,
+                        compute_force=need_force,
+                        compute_virial=compute_virial,
+                    )
+                    pot_now += result["energy"]
+                    if result["forces"] is not None:
+                        f_ch = result["forces"]
+                        if f_ch.dim() == 3:
+                            f_ch = f_ch.squeeze(0)
+                        f_ch_list.append(f_ch)
+                    if result["virial"] is not None:
+                        v_ch_list.append(result["virial"])
                 if f_ch_list:
                     force_full[mask] = torch.stack(f_ch_list, dim=0).sum(dim=0)
                 if v_ch_list:

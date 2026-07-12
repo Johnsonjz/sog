@@ -45,7 +45,17 @@ class SOGKSpace : public KSpace {
   void setup() override;
   void compute(int eflag, int vflag) override;
   void compute_single(int eflag, int vflag);
+  void apply_k0_correction_single_channel(int eflag, int vflag);
+  void apply_k0_correction_multi_channel(double &energy_acc, double virial_acc[6],
+                                         int eflag, int vflag,
+                                         double qsum_total, double qsqsum_total);
   double memory_usage() override;
+
+  // Per-atom electrostatic potential v_i = ∂E_k/∂q_i (filled in compute_single when
+  // want_potential is set). Consumed by the charge-response fix to feed the model's
+  // ∂q/∂r backward (DPLR analog of pppm_dplr::get_fele()).
+  const std::vector<double> &get_potential() const { return vpot; }
+  void set_want_potential(bool v) { want_potential = v; }
 
  protected:
   // ── SOG kernel parameters ──
@@ -60,8 +70,12 @@ class SOGKSpace : public KSpace {
 
   // ── Spline / grid method selection ──
   int spline_type;       // 0 = B-spline order 5 (legacy), 4 = CubeS2 4th, 6 = CubeS2 6th
+  bool is_quads = false; // false = CubeS₂ (non-separable); true = QuadS (separable, Form-A)
   int grid_method;       // 0 = SOG bandwidth (new), 1 = PPPM iteration (legacy)
   double phi_max_user;   // user-specified φ_max override (>0 means active, −1 = auto)
+  double phi_accuracy_user;  // target rel-accuracy ε for the φ_max general method (−1 = default)
+  bool enable_gpu = false;   // route compute_single to sog_gpu.cu (raw CUDA + cuFFT)
+  void *gpu_ = nullptr;      // opaque SogGpuState* (global-ns; sog_gpu.cuh is C)
 
   // ── Computed from SOG params + cutoff ──
   double w0;             // real-space correction factor (only on m=0 term)
@@ -80,14 +94,19 @@ class SOGKSpace : public KSpace {
 
   std::vector<FFT_SCALAR> mesh_rho;
   std::vector<FFT_SCALAR> mesh_fft_work;
-  std::vector<FFT_SCALAR> mesh_gradx;
-  std::vector<FFT_SCALAR> mesh_grady;
+  std::vector<FFT_SCALAR> mesh_gradx;  std::vector<FFT_SCALAR> mesh_grady;
   std::vector<FFT_SCALAR> mesh_gradz;
+
+  // ── Per-atom potential v_i = ∂E_k/∂q_i (charge-response feedback) ──
+  bool want_potential = false;            // gate: fill vpot in compute_single
+  std::vector<FFT_SCALAR> mesh_pot;       // k-space then real-space mesh potential u_j
+  std::vector<double> vpot;               // gathered per-atom potential v_i (nlocal)
 
   // ── Precomputed Green functions ──
   std::vector<double> mesh_green_energy;
   std::vector<double> mesh_green_force;
   std::vector<double> mesh_green_self;
+  std::vector<double> mesh_green_self_virial;  // bare K_v(k²): self-energy strain-derivative virial
   std::vector<double> mesh_green_virial;  // K_virial(k²)/|Φ(k)|²
 
   // ── Box-independent sinc tables ──

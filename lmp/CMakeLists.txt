@@ -48,10 +48,15 @@ target_include_directories(sog_lmp PRIVATE
 )
 
 # LAMMPS compile definitions (required for FFT3d, KSpace, etc.)
+# Must match the target LAMMPS build's size setting (default LAMMPS_SMALLBIG); the old
+# BIGBIG+SMALLSMALL pair was contradictory and SMALLSMALL is no longer supported.
 target_compile_definitions(sog_lmp PRIVATE
-  LAMMPS_BIGBIG
-  LAMMPS_SMALLSMALL
+  LAMMPS_SMALLBIG
 )
+
+# ── MPI (LAMMPS headers pull in mpi.h) ──
+find_package(MPI REQUIRED)
+target_link_libraries(sog_lmp PRIVATE MPI::MPI_CXX)
 
 # ── FFT library (LAMMPS requires FFT3d) ──
 # Default: try FFTW3. Override with -DFFT_LIB=<path> if needed.
