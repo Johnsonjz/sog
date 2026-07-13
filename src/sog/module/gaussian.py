@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -344,6 +344,39 @@ class Gaussian(nn.Module):
             compute_virial=False,
         )["energy"]
 
+    @staticmethod
+    def _greedy_group_by_nloc(
+        nloc_per_frame: List[int], max_waste: float
+    ) -> List[List[Tuple[int, int]]]:
+        """Greedy grouping of frame indices by similar atom count.
+
+        Sorts frames by *nloc*, then walks the sorted list, adding each frame
+        to the current group as long as the group's padding waste stays ≤
+        *max_waste*.  Returns a list of groups; each group is a list of
+        ``(original_frame_index, nloc)`` tuples.
+        """
+        indexed = sorted(enumerate(nloc_per_frame), key=lambda x: x[1])
+        groups: List[List[Tuple[int, int]]] = []
+        cur = [indexed[0]]
+        cur_max = indexed[0][1]
+        cur_sum = indexed[0][1]
+        for idx, nl in indexed[1:]:
+            new_max = max(cur_max, nl)
+            new_sum = cur_sum + nl
+            new_nf = len(cur) + 1
+            new_waste = (new_nf * new_max - new_sum) / new_sum if new_sum > 0 else 0.0
+            if new_waste <= max_waste:
+                cur.append((idx, nl))
+                cur_max = new_max
+                cur_sum = new_sum
+            else:
+                groups.append(cur)
+                cur = [(idx, nl)]
+                cur_max = nl
+                cur_sum = nl
+        groups.append(cur)
+        return groups
+
     def compute_bundle(
         self,
         q: torch.Tensor,
@@ -419,36 +452,100 @@ class Gaussian(nn.Module):
             nk0 = nk_by_frame[0]
             n_total = r.shape[0]
             _nk_ok = all(nkf == nk0 for nkf in nk_by_frame)
-            _nloc_ok = n_total % nf_b == 0
             # ── nk-relaxed batched path: use max nk across frames for the shared k-grid.
             #     Frames with smaller nk get extra zero-masked modes (the mode_mask
             #     is computed per-frame and zeros out |k|>k_max). This handles ±2% NPT
             #     box fluctuations without falling through to the per-frame loop.
             _nk_max = tuple(int(max(nkf[i] for nkf in nk_by_frame)) for i in range(3))
+
+            # ── per-frame atom counts (needed for mixed-nloc batching) ──
+            _nloc_by_frame = torch.bincount(batch, minlength=nf_b).tolist()
+            _nloc_max = max(_nloc_by_frame)
+            _nloc_min = min(_nloc_by_frame)
+            _nloc_ok = (_nloc_min == _nloc_max)
+
             if _print_diag:
                 print(f"[SOG-DIAG] batched gate: _direct_mode={_direct_mode} nf={nf_b} "
                       f"nk_by_frame={nk_by_frame} nk_ok={_nk_ok} nloc_ok={_nloc_ok} "
-                      f"nk_max={_nk_max} ntot={n_total} nloc_bat={n_total//nf_b if _nloc_ok else '??'}")
+                      f"nk_max={_nk_max} ntot={n_total} nloc_bat={_nloc_max if _nloc_ok else f'mix[{_nloc_min},{_nloc_max}]'}")
+
+            _batched_energy: Optional[torch.Tensor] = None
+            _n_dl_float = float(n_dl_direct)
+
+            # ── Three-level batched-direct decision ──
+            # Level 0: uniform nloc + canonical batch → direct (zero-overhead fast path)
+            # Level 1: non-uniform nloc, waste ≤ _waste_threshold → full padding
+            # Level 2: waste > _waste_threshold → greedy grouping per group
+            _waste_threshold = 1.0  # max acceptable padding overhead ratio
+
             if _nloc_ok:
-                nloc_b = n_total // nf_b
-                canonical = torch.equal(
+                # Level 0: uniform nloc — try canonical fast path
+                _canonical = torch.equal(
                     batch,
                     torch.arange(
                         nf_b, device=batch.device, dtype=batch.dtype
-                    ).repeat_interleave(nloc_b),
+                    ).repeat_interleave(_nloc_max),
                 )
-                if canonical:
-                    energy_batched = self._compute_bundle_direct_batched(
-                        q, r, cell, nf_b, nloc_b,
-                        _nk_max,
-                        float(n_dl_direct),
+                if _canonical:
+                    _batched_energy = self._compute_bundle_direct_batched(
+                        q, r, cell, nf_b, [_nloc_max] * nf_b,
+                        _nk_max, _n_dl_float,
                     )
-                    return {
-                        "energy": energy_batched,
-                        "forces": None,
-                        "virial": None,
-                        "used_explicit_derivatives": False,
-                    }
+            elif n_total > 0:
+                _waste = (nf_b * _nloc_max - n_total) / n_total
+                if _waste <= _waste_threshold:
+                    # Level 1: full-padding batched (atoms already in canonical order from PyG)
+                    if _print_diag:
+                        print(f"[SOG-DIAG] batched gate → Level 1 (full pad): waste={_waste:.2%}")
+                    _batched_energy = self._compute_bundle_direct_batched(
+                        q, r, cell, nf_b, _nloc_by_frame,
+                        _nk_max, _n_dl_float,
+                    )
+                else:
+                    # Level 2: greedy grouping
+                    _groups = self._greedy_group_by_nloc(_nloc_by_frame, _waste_threshold)
+                    if _print_diag:
+                        _g_sizes = [len(g) for g in _groups]
+                        print(f"[SOG-DIAG] batched gate → Level 2 (grouped): waste={_waste:.2%} "
+                              f"groups={_g_sizes}")
+                    _batched_energy = q.new_zeros(nf_b)  # type: ignore[union-attr]
+                    for _group in _groups:
+                        _g_indices = [gi for gi, _ in _group]
+                        _g_nlocs = [gn for _, gn in _group]
+                        _g_nf = len(_group)
+                        if _g_nf == 0:
+                            continue
+                        # Gather atoms for this group (frames may be non-contiguous
+                        # after sorting by nloc)
+                        _g_r_parts = []
+                        _g_q_parts = []
+                        _cumsum = 0
+                        _cumsum_map = {}
+                        for _orig_idx in range(nf_b):
+                            _cumsum_map[_orig_idx] = _cumsum
+                            _cumsum += _nloc_by_frame[_orig_idx]
+                        for _orig_idx, _ in _group:
+                            _start = _cumsum_map[_orig_idx]
+                            _nl = _nloc_by_frame[_orig_idx]
+                            _g_r_parts.append(r[_start : _start + _nl])
+                            _g_q_parts.append(q[_start : _start + _nl])
+                        _g_r = torch.cat(_g_r_parts, dim=0)
+                        _g_q = torch.cat(_g_q_parts, dim=0)
+                        _g_cell = cell[_g_indices]
+                        _g_energy = self._compute_bundle_direct_batched(
+                            _g_q, _g_r, _g_cell, _g_nf, _g_nlocs,
+                            _nk_max, _n_dl_float,
+                        )
+                        for _j, _orig_idx in enumerate(_g_indices):
+                            _batched_energy[_orig_idx] = _g_energy[_j]
+
+            if _batched_energy is not None:
+                return {
+                    "energy": _batched_energy,
+                    "forces": None,
+                    "virial": None,
+                    "used_explicit_derivatives": False,
+                }
 
         for bid in bids_py:
             mask = batch == bid
@@ -1086,17 +1183,19 @@ class Gaussian(nn.Module):
         r: torch.Tensor,
         cell: torch.Tensor,
         nf: int,
-        nloc: int,
+        nloc_per_frame: List[int],
         nk: Tuple[int, int, int],
         n_dl: float,
     ) -> torch.Tensor:
-        """Batched direct k-sum over uniform-nloc, uniform-nk frames → per-frame
-        energy [nf]. Collapses the per-frame Python loop (dozens of tiny kernel
-        launches × nf) into single batched ops — the dominant cost for small
-        systems is launch overhead, not FLOPs. Bit-matches the per-frame loop
-        (compute_potential_triclinic + the k=0 correction). Differentiable w.r.t.
-        r and cell, so forces/virial (incl. the charge-response) come from autograd,
-        exactly as in the loop path (explicit_all=False)."""
+        """Batched direct k-sum over (possibly mixed-nloc) frames → per-frame
+        energy [nf].  Collapses the per-frame Python loop (dozens of tiny kernel
+        launches × nf) into single batched ops.  For uniform atom counts the
+        standard ``.view`` fast path is used; for mixed sizes, shorter frames are
+        zero-padded to ``max(nloc_per_frame)`` — the zero-charge padding atoms
+        contribute identically zero to the structure factor, so the energy is
+        mathematically exact.  Differentiable w.r.t. *r* and *cell*."""
+        _nloc_max = max(nloc_per_frame)
+        _nloc_uniform = min(nloc_per_frame) == _nloc_max
         device = r.device
         dtype = r.dtype
         two_pi = 2.0 * math.pi
@@ -1105,8 +1204,20 @@ class Gaussian(nn.Module):
             q = q.unsqueeze(1)
         nch = q.shape[1]
         r_f = q.new_zeros(0)  # placeholder for type checkers
-        r_f = r.view(nf, nloc, 3)
-        q_f = q.view(nf, nloc, nch)
+        _nloc_tensor = None   # per-frame atom counts as a tensor (used for mean)
+        if _nloc_uniform:
+            r_f = r.view(nf, _nloc_max, 3)
+            q_f = q.view(nf, _nloc_max, nch)
+        else:
+            r_f = q.new_zeros(nf, _nloc_max, 3)
+            q_f = q.new_zeros(nf, _nloc_max, nch)
+            offset = 0
+            for _i, _ni in enumerate(nloc_per_frame):
+                if _ni > 0:
+                    r_f[_i, :_ni] = r[offset : offset + _ni]
+                    q_f[_i, :_ni] = q[offset : offset + _ni]
+                    offset += _ni
+            _nloc_tensor = torch.tensor(nloc_per_frame, device=device, dtype=dtype)
 
         volume = torch.abs(torch.det(cell))          # [nf], differentiable
         inv2v = 1.0 / (2.0 * volume)                 # [nf]
@@ -1163,9 +1274,8 @@ class Gaussian(nn.Module):
         if self.remove_self_interaction:
             pot = pot - kfac_eff * q_sq_sum * inv2v * self.norm_factor
         if self.charge_neutral_lambda is not None and self.charge_neutral_lambda > 0:
-            pot = pot + float(self.charge_neutral_lambda) * (
-                q_f.mean(dim=1) ** 2
-            ).sum(dim=1)
+            _q_mean = (q_f.sum(dim=(1, 2)) / (_nloc_tensor if _nloc_tensor is not None else _nloc_max)).unsqueeze(1)  # [nf,1]
+            pot = pot + float(self.charge_neutral_lambda) * (_q_mean ** 2).sum(dim=1)
         return pot  # [nf]
 
     def _compute_periodic_direct(
