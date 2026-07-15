@@ -137,6 +137,13 @@ def refit(ds_eps):
     return math.exp(logC), float(p)
 
 
+def refit_fixed_p(ds_eps, p_theory):
+    """(ds, eps) points -> C only, with p = p_theory (2*nu) enforced by theory.
+    Refit via: C = median(eps / ds^{p_theory})."""
+    C_vals = [eps / (ds ** p_theory) for ds, eps in ds_eps]
+    return float(np.median(C_vals))
+
+
 # ── main ────────────────────────────────────────────────────────────────────────────────
 def headline():
     print("=" * 78)
@@ -212,7 +219,7 @@ def main():
                           f"  (CV {100*sd/mu:4.1f}%)  range [{min(vals):.3f}, {max(vals):.3f}]")
                 else:
                     print(f"   eps={eps:.0e}: no accuracy-limited anchors (all validity/floor)")
-    # REFIT + report
+    # REFIT + report (both free-p and theory-enforced p=2ν)
     print("\n" + "=" * 78)
     print("REFIT — pooled (C_nu, p_nu) from bisected anchors  vs  current constants")
     print("=" * 78)
@@ -224,16 +231,22 @@ def main():
             pts = [(a["ds"], a["eps"]) for a in anchors[order][metric]]
             if len(pts) < 3:
                 print(f"  order-{order}: too few anchors ({len(pts)})"); continue
+            # Free-p fit (for diagnostics only)
             C, p = refit(pts)
-            out["refit"][f"{metric}_o{order}"] = {"C": C, "p": p, "npts": len(pts)}
-            cur = CPP_FORCE[order] if metric == "force" else FALLBACK_LAW[order]
-            phi_new = phi_max_from_law(smin_cons, RCUT, order, 1e-4, {"C": C, "p": p})
-            phi_cur = phi_max_from_law(smin_cons, RCUT, order, 1e-4, cur)
-            g_new = cons_prod_grid(phi_new, order); g_cur = cons_prod_grid(phi_cur, order)
-            print(f"  order-{order}: REFIT  C={C:.3e} p={p:.3f} (n={len(pts)})   "
-                  f"current {'cpp' if metric=='force' else 'py '} C={cur['C']:.3e} p={cur['p']:.3f}")
-            print(f"           phi(1e-4): refit={phi_new:.4f} -> grid {g_new[0]}x{g_new[1]}x{g_new[2]}"
-                  f"   |  current={phi_cur:.4f} -> grid {g_cur[0]}x{g_cur[1]}x{g_cur[2]}")
+            # Theory-enforced fit: p = 2*nu, C = median(eps/ds^{2nu})
+            p_theory = int(order)  # 4 or 6 = 2*nu
+            C_fixed = refit_fixed_p(pts, p_theory)
+            out["refit"][f"{metric}_o{order}"] = {"C": C, "p": p, "C_fixed_p": C_fixed,
+                                                    "p_fixed": p_theory, "npts": len(pts)}
+            cur_fallback = FALLBACK_LAW[order]
+            phi_free = phi_max_from_law(smin_cons, RCUT, order, 1e-4, {"C": C, "p": p})
+            phi_fixed = phi_max_from_law(smin_cons, RCUT, order, 1e-4, {"C": C_fixed, "p": p_theory})
+            phi_old = phi_max_from_law(smin_cons, RCUT, order, 1e-4, cur_fallback)
+            print(f"  order-{order}: FREE-fit C={C:.3e} p={p:.3f}    "
+                  f"THEORY (p={p_theory}) C={C_fixed:.3e}    "
+                  f"old C={cur_fallback['C']:.3e} p={cur_fallback['p']:.3f}   (n={len(pts)})")
+            print(f"           phi(1e-4): free={phi_free:.4f}  theory={phi_fixed:.4f}  old={phi_old:.4f}"
+                  f"  (cons sigma_min={smin_cons:.3f} A)")
     with open(os.path.join(HERE, "phi_max_anchors.json"), "w") as f:
         json.dump(out, f, indent=1, default=float)
     print(f"\nwrote {os.path.join(HERE, 'phi_max_anchors.json')}")

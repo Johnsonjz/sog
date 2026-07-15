@@ -179,6 +179,7 @@ class Sog(nn.Module):
         self.m = int(args.get("m", 12))
         self.remove_self_interaction = bool(args.get("remove_self_interaction", True))
         self.charge_neutral_lambda = args.get("charge_neutral_lambda", None)
+        self.charge_neutral = bool(args.get("charge_neutral", False))
         self.nufft = bool(args.get("nufft", args.get("use_nufft", False)))
         self.use_nufft = self.nufft
         self.nufft_eps = float(args.get("nufft_eps", 1e-4))
@@ -213,6 +214,27 @@ class Sog(nn.Module):
             latent_charges = self.atomwise(desc, batch)
         else:
             raise ValueError("Either desc or latent_charges must be provided")
+
+        if self.charge_neutral:
+            # Hard per-frame per-channel charge neutrality: subtract the per-frame
+            # mean so that sum_i q_i = 0 for each frame and each charge channel.
+            # This mirrors DeepMD's _corr_head (lr_fitting.py:521-528).
+            n_frames = int(batch.max().item()) + 1
+            frame_sum = torch.zeros(
+                n_frames, latent_charges.shape[1],
+                dtype=latent_charges.dtype, device=latent_charges.device,
+            )
+            frame_count = torch.zeros(
+                n_frames, dtype=latent_charges.dtype, device=latent_charges.device,
+            )
+            frame_sum.scatter_add_(
+                0, batch.unsqueeze(-1).expand_as(latent_charges), latent_charges,
+            )
+            frame_count.scatter_add_(
+                0, batch, torch.ones_like(latent_charges[:, 0]),
+            )
+            frame_mean = frame_sum / frame_count.clamp(min=1).unsqueeze(-1)
+            latent_charges = latent_charges - frame_mean[batch]
 
         if compute_energy:
             e_lr = self.gaussian(

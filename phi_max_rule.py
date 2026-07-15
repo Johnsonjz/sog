@@ -31,15 +31,19 @@ import numpy as np
 # xi0 (spreading width constant) per CubeS2 order -- from sog_spline.h (kCubes2Xi4/6)
 XI0 = {4: 0.5773502691896258, 6: 0.6503998764035732}
 
-# Grid-error law  rel(phi) = C*(Delta/sigma_min)^p , calibrated by DIRECT BISECTION of the true
-# FFT-vs-direct FORCE-rel curve on a panel of random systems x kernels (calibrate_phi_max_anchors.py,
-# 2026-07-10). Force-rel is canonical: it is what MD is driven by, it matches the C++ auto-derive
-# (sog.cpp), and it is the metric where the single-parameter (Delta/sigma_min) law actually collapses
-# (CV ~5% across kernels/systems; energy-rel scatters 15-30% and floors out). These REPLACE the old
-# back-fit constants that were tuned so eps=1e-4 reproduced phi=0.10 -- the true force-rel at phi=0.10
-# (order-6 cons) is ~2e-3, NOT 1e-4 (optimistic ~30x). At eps=1e-4 this honest law gives phi=0.068
-# (order-6) / 0.032 (order-4) on the cons kernel. Anchors + fit in sog/phi_max_anchors.json.
-FALLBACK_LAW = {4: {"p": 3.956, "C": 4.465e-2}, 6: {"p": 6.533, "C": 1.681e-2}}
+# Grid-error law  rel(phi) = C_nu * (Delta/sigma_min)^{2nu} , where 2nu is the spline order.
+# The EXPONENT IS ENFORCED FROM THEORY: Proposition 5 establishes the leading error is O(Delta^{2nu}),
+# so p_nu = 2nu (4 for order-4, 6 for order-6).  Only the prefactor C_nu is calibrated — by refitting
+# the bisection anchors (calibrate_phi_max_anchors.py, phi_max_anchors.json) with p FIXED at 2nu,
+# taking the MEDIAN C over a panel of random SOG kernels x random charge configurations.
+#
+# Force-rel is canonical: it is what MD is driven by, it matches the C++ auto-derive (sog.cpp), and it
+# is the metric where the single-parameter (Delta/sigma_min) law collapses (CV ~5% across kernels;
+# energy-rel scatters 15-30% and floors out).  The old back-fit (p ~3.96/6.53, C tuned to reproduce
+# phi=0.10 at eps=1e-4) was optimistic ~30x in force-rel; the true force-rel at phi=0.10 (order-6 cons)
+# is ~2e-3.  With honest p=2nu, the median-refit C gives phi(eps=1e-4) = 0.032 (order-4) / 0.066
+# (order-6) on the cons kernel (sigma_min=0.750 A).  Refit date: 2026-07-13.
+FALLBACK_LAW = {4: {"p": 4, "C": 4.953e-2}, 6: {"p": 6, "C": 1.377e-2}}
 
 
 def sigma_min_of(bandwidth):
