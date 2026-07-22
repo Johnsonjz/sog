@@ -12,28 +12,30 @@
 
 namespace LAMMPS_NS {
 
-// ── B-spline order (legacy) ──
-constexpr int kSog_BSplineOrder = 5;
-constexpr int kSog_AssignOrder = kSog_BSplineOrder;  // used by both .cpp files
+// ── B-spline weights (generalized to arbitrary order n) ──
+// Legacy fastsog compatibility — generalized Cox-de Boor for order 4/5/6.
+// Main sog.cpp uses sog_bspline_weights_1d_order() instead.
 
-inline void fastsog_bspline_weights_1d(const double frac,
-                                        std::array<double, 5> &w) {
-  w.fill(0.0);
+inline void fastsog_bspline_weights_1d(const int n, const double frac,
+                                        std::vector<double> &w) {
+  w.resize(n);
+  std::fill(w.begin(), w.end(), 0.0);
   w[0] = 1.0 - frac;
   w[1] = frac;
-  for (int k = 3; k <= 5; ++k) {
+  for (int k = 3; k <= n; ++k) {
     const double inv = 1.0 / static_cast<double>(k - 1);
+    std::vector<double> w_prev = w;
     w[static_cast<size_t>(k - 1)] =
-        frac * w[static_cast<size_t>(k - 2)] * inv;
+        frac * w_prev[static_cast<size_t>(k - 2)] * inv;
     for (int j = 1; j <= k - 2; ++j) {
       w[static_cast<size_t>(k - 1 - j)] =
           ((frac + static_cast<double>(j)) *
-               w[static_cast<size_t>(k - 2 - j)] +
+               w_prev[static_cast<size_t>(k - 2 - j)] +
            (static_cast<double>(k - j) - frac) *
-               w[static_cast<size_t>(k - 1 - j)]) *
+               w_prev[static_cast<size_t>(k - 1 - j)]) *
           inv;
     }
-    w[0] = (1.0 - frac) * w[0] * inv;
+    w[0] = (1.0 - frac) * w_prev[0] * inv;
   }
 }
 

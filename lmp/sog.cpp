@@ -22,12 +22,7 @@
 ------------------------------------------------------------------------- */
 
 #include "sog.h"
-// GPU path (raw CUDA + cuFFT) is a compile-time option. The deepmd-kit plugin build defines
-// SOG_ENABLE_GPU and ships sog_gpu.cu/.cuh; this standalone sog/lmp build is CPU-only (CXX only),
-// so the GPU include and call sites are compiled out. Algorithm otherwise identical to deepmd-kit.
-#ifdef SOG_ENABLE_GPU
 #include "sog_gpu.cuh"
-#endif
 #include "sog_spline.h"
 
 #include "atom.h"
@@ -38,11 +33,7 @@
 #include "force.h"
 #include "math_const.h"
 #include "pair.h"
-// Multi-channel latent charges couple to the deepmd pair (ncharge_channels). The deepmd-kit plugin
-// build defines SOG_WITH_DEEPMD; this standalone build is single-channel and omits the coupling.
-#ifdef SOG_WITH_DEEPMD
 #include "pair_deepmd.h"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -91,27 +82,30 @@ int wrap_index(int i, const int n) {
   return i;
 }
 
-// ── B-spline weights (order 5) ──
-constexpr int kSog_BSplineOrder = 5;
-
-void sog_bspline_weights_1d(const double frac,
-                        std::array<double, kSog_BSplineOrder> &w) {
-  w.fill(0.0);
+// ── B-spline weights (generalized to arbitrary order n) ──
+// Cox-de Boor recurrence for cardinal B-splines.
+// Number of nodes per axis = n, support indices = {floor(x)-n/2+1, ..., floor(x)+n/2} (even n)
+// or {floor(x)-(n-1)/2, ..., floor(x)+(n-1)/2} (odd n).
+inline void sog_bspline_weights_1d_order(const int n, const double frac,
+                                         std::vector<double> &w) {
+  w.resize(n);
+  std::fill(w.begin(), w.end(), 0.0);
   w[0] = 1.0 - frac;
   w[1] = frac;
-  for (int k = 3; k <= kSog_BSplineOrder; ++k) {
+  for (int k = 3; k <= n; ++k) {
     const double inv = 1.0 / static_cast<double>(k - 1);
+    std::vector<double> w_prev = w;
     w[static_cast<size_t>(k - 1)] =
-        frac * w[static_cast<size_t>(k - 2)] * inv;
+        frac * w_prev[static_cast<size_t>(k - 2)] * inv;
     for (int j = 1; j <= k - 2; ++j) {
       w[static_cast<size_t>(k - 1 - j)] =
           ((frac + static_cast<double>(j)) *
-               w[static_cast<size_t>(k - 2 - j)] +
+               w_prev[static_cast<size_t>(k - 2 - j)] +
            (static_cast<double>(k - j) - frac) *
-               w[static_cast<size_t>(k - 1 - j)]) *
+               w_prev[static_cast<size_t>(k - 1 - j)]) *
           inv;
     }
-    w[0] = (1.0 - frac) * w[0] * inv;
+    w[0] = (1.0 - frac) * w_prev[0] * inv;
   }
 }
 
@@ -342,7 +336,6 @@ double compute_w0(const double r0, const double b) {
 
 constexpr int kGridMin = 8;
 constexpr int kGridMaxIter = 500;
-constexpr int kSog_AssignOrder = kSog_BSplineOrder;
 constexpr int kAliasExtent = 8;
 
 double pppm_ik_error_estimate_order5(const double h, const double prd,
@@ -510,9 +503,16 @@ void SOGKSpace::settings(int narg, char **arg) {
       if (iarg + 1 >= narg)
         error->all(FLERR, "sog missing spline value");
       const std::string val(arg[iarg + 1]);
-      if (val == "bspline")
+      if (val == "bspline" || val == "bspline_5") {
         spline_type = 0;
-      else if (val == "cubes2_4")
+        bspline_order = 5;
+      } else if (val == "bspline_4") {
+        spline_type = 0;
+        bspline_order = 4;
+      } else if (val == "bspline_6") {
+        spline_type = 0;
+        bspline_order = 6;
+      } else if (val == "cubes2_4")
         spline_type = 4;
       else if (val == "cubes2_6")
         spline_type = 6;
@@ -524,7 +524,7 @@ void SOGKSpace::settings(int narg, char **arg) {
         is_quads = true;
       } else
         error->all(FLERR,
-                   "sog spline expects bspline, cubes2_4, cubes2_6, quads_4, or quads_6");
+                   "sog spline expects bspline[_4/_5/_6], cubes2_4, cubes2_6, quads_4, or quads_6");
       iarg += 2;
     } else if (key == "grid_method") {
       if (iarg + 1 >= narg)
@@ -555,6 +555,30 @@ void SOGKSpace::settings(int narg, char **arg) {
         enable_gpu = false;
       else
         error->all(FLERR, "sog use_gpu expects yes or no");
+      iarg += 2;
+    } else if (key == "direct") {
+      // Enable exact direct k-space summation (no mesh/FFT).
+      // "direct yes [kmax]" — kmax overrides auto (σ_min-based, tail ≲ 1e-12).
+      if (iarg + 1 >= narg)
+        error->all(FLERR, "sog missing direct value");
+      if (strcmp(arg[iarg + 1], "yes") == 0) {
+        use_direct = true;
+        if (iarg + 2 < narg) {
+          // optional k_max override
+          const char *next = arg[iarg + 2];
+          bool is_num = true;
+          for (const char *p = next; *p; ++p)
+            if (!(isdigit(*p) || *p == '.' || *p == 'e' || *p == 'E' || *p == '-' || *p == '+'))
+            { is_num = false; break; }
+          if (is_num) {
+            direct_kmax = atof(next);
+            iarg += 1;
+          }
+        }
+      } else if (strcmp(arg[iarg + 1], "no") == 0) {
+        use_direct = false;
+      } else
+        error->all(FLERR, "sog direct expects yes or no");
       iarg += 2;
     } else if (key == "phi_accuracy") {
       // Target relative energy accuracy ε for the φ_max general method (grid sizing).
@@ -773,9 +797,9 @@ void SOGKSpace::init() {
   // Extract cutoff from pair style (needed for w0 computation)
   int itmp = 0;
   auto *p_cutoff = (double *)force->pair->extract("cut_coul", itmp);
-  const double rcut = (p_cutoff != nullptr && *p_cutoff > 0.0)
+  const double rcut = (p_cutoff != nullptr && std::isfinite(*p_cutoff) && *p_cutoff >= 1.0)
                           ? *p_cutoff
-                          : n_dl;
+                          : (n_dl > 0.0 ? n_dl : 5.0);
   if (!(rcut > 0.0))
     error->all(FLERR, "sog requires positive rcut (from cut_coul or n_dl)");
 
@@ -877,13 +901,13 @@ void SOGKSpace::ensure_fft_plan() {
   // Retrieve rcut once for grid sizing
   int itmp = 0;
   auto *p_cutoff = (double *)force->pair->extract("cut_coul", itmp);
-  const double rcut = (p_cutoff != nullptr && *p_cutoff > 0.0)
+  const double rcut = (p_cutoff != nullptr && std::isfinite(*p_cutoff) && *p_cutoff >= 1.0)
                           ? *p_cutoff
-                          : n_dl;
+                          : (n_dl > 0.0 ? n_dl : 5.0);
 
   int nx, ny, nz;
 
-  if (grid_method == 0 && spline_type > 0) {
+  if (grid_method == 0 || phi_max_user > 0.0) {
     // ── SOG-bandwidth grid estimation ──
     // φ_max from midtown-sog.md Table III (paper JCP 153, 224117):
     //   CubeS₂ 4th, b=2:      φ_max = 0.23
@@ -913,17 +937,26 @@ void SOGKSpace::ensure_fft_plan() {
       for (double bw : bandwidth)
         if (bw < bw_min) bw_min = bw;
       const double sigma_min = std::sqrt(bw_min);
-      // (C_ν, p_ν) = HONEST FORCE-rel error law from calibrate_phi_max_anchors.py (2026-07-10):
-      // φ_max pinned by BISECTION of the true FFT-vs-direct force-rel curve on a PANEL of random
-      // systems × kernels, then pooled log-log refit. The single-parameter (Δ/σ_min) law collapses
-      // tightly for force-rel (CV ~5%); energy-rel does not (15-30%). These REPLACE the old back-fit
-      // constants (2.10e-3/7.59, 1.90e-3/3.69) that were tuned so ε=1e-4 reproduced φ=0.10/0.0675 —
-      // the true force-rel at φ=0.10 (order-6 cons) is ~2e-3, NOT 1e-4 (optimistic ~30×). With these
-      // honest constants ε=1e-4 gives φ=0.068 (order-6) / 0.032 (order-4) on the cons kernel → a finer
-      // mesh (75×150×150). PRODUCTION pins explicit phi_max=0.10 (force-rel ~2e-3, validated adequate:
-      // RDF/density match DPA + experiment); auto-derive here targets genuine 1e-4 accuracy.
-      const double C_nu = (spline_type == 6) ? 1.681e-2 : 4.465e-2; // honest force-rel prefactor (bisection panel)
-      const double p_nu = (spline_type == 6) ? 6.533 : 3.956;       // honest force-rel convergence exponent
+      // (C_ν, p_ν) = THEORY-ENFORCED force-rel error law: p_nu = 2*nu from Proposition 5;
+      // C_nu = per-spline-family force-rel prefactor (CubeS₂=Form B variance-subtraction,
+      // QuadS=Form A exact window division, ~100× smaller C).  Calibrated by bisection
+      // (calibrate_phi_max_anchors.py) + ε-ladder sweep on random water-like systems
+      // (precision_sweep_py.py).  See phi_max_rule.py::CUBES2_LAW / QUADS_LAW.
+      // With honest p=2ν, ε=1e-4 → φ=0.032 (order-4) / 0.066 (order-6) on the cons kernel
+      // for CubeS₂; QuadS can use coarser grids at the same accuracy target.
+      // PRODUCTION pins explicit phi_max=0.10 (force-rel ~2e-3, validated adequate).
+      double C_nu, p_nu;
+      if (is_quads) {
+        // Form A (exact window division): only charge-spreading error remains.
+        // Measured F_rel ≤ 1×10⁻⁴ at all tested grids (Δ/σ_min ≤ 0.95); true C
+        // likely smaller but n_dl=0.5 reference cannot resolve below ~9×10⁻⁵.
+        C_nu = (spline_type == 6) ? 2.0e-4 : 2.0e-4;
+        p_nu = (spline_type == 6) ? 6.0 : 4.0;
+      } else {
+        // Form B (variance subtraction): pooled-median bisection constants.
+        C_nu = (spline_type == 6) ? 1.377e-2 : 4.953e-2;
+        p_nu = (spline_type == 6) ? 6.0 : 4.0;
+      }
       const double eps_default = 1.0e-4;                            // canonical target force-rel accuracy
       const double eps = (phi_accuracy_user > 0.0) ? phi_accuracy_user : eps_default;
       const double ds = std::pow(eps / C_nu, 1.0 / p_nu);          // Δ/σ_min at target ε
@@ -1012,7 +1045,6 @@ void SOGKSpace::ensure_fft_plan() {
     mesh_ly = ly;
     mesh_lz = lz;
     precompute_green_functions();
-#ifdef SOG_ENABLE_GPU
     if (enable_gpu) {
       if (!gpu_) gpu_ = sog_gpu_create();
       sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
@@ -1020,7 +1052,6 @@ void SOGKSpace::ensure_fft_plan() {
                     mesh_green_self.data(), mesh_green_virial.data(),
                     mesh_green_self_virial.data());
     }
-#endif
     return;
   }
 
@@ -1064,7 +1095,6 @@ void SOGKSpace::ensure_fft_plan() {
     precompute_sinc_tables();
   }
   precompute_green_functions();
-#ifdef SOG_ENABLE_GPU
   if (enable_gpu) {
     if (!gpu_) gpu_ = sog_gpu_create();
     sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
@@ -1072,7 +1102,7 @@ void SOGKSpace::ensure_fft_plan() {
                   mesh_green_self.data(), mesh_green_virial.data(),
                   mesh_green_self_virial.data());
   }
-#endif
+  if (use_direct) enumerate_direct_kvecs();
   mesh_ready = true;
 }
 
@@ -1081,7 +1111,7 @@ void SOGKSpace::ensure_fft_plan() {
 // ──────────────────────────────────────────────────────────────────────
 
 void SOGKSpace::precompute_sinc_tables() {
-  const int assign_pow = 2 * kSog_AssignOrder;  // = 10
+  const int assign_pow = 2 * bspline_order;  // = 2n
   const int alias_cnt = 2 * mesh_alias_extent + 1;
 
   // X
@@ -1693,13 +1723,9 @@ void SOGKSpace::apply_k0_correction_multi_channel(
 //   q_eff[i] = Σ_ch q_{i,ch}
 // This gives the correct total charge density for the kspace solver.
 void SOGKSpace::compute(int eflag, int vflag) {
-#ifdef SOG_WITH_DEEPMD
   auto *pair_dp = dynamic_cast<PairDeepMD *>(force->pair);
   const int nchannels =
       (pair_dp != nullptr) ? pair_dp->ncharge_channels : 1;
-#else
-  const int nchannels = 1;  // standalone build: single-channel only (no PairDeepMD coupling)
-#endif
 
   const int nlocal = atom->nlocal;
 
@@ -1711,7 +1737,6 @@ void SOGKSpace::compute(int eflag, int vflag) {
     return;
   }
 
-#ifdef SOG_WITH_DEEPMD
   // ── Multi-channel: collapse to single effective charge ──
   // Save original charges and forces
   std::vector<double> q_orig(nlocal);
@@ -1761,7 +1786,6 @@ void SOGKSpace::compute(int eflag, int vflag) {
     atom->f[i][1] = f_orig[i][1];
     atom->f[i][2] = f_orig[i][2];
   }
-#endif  // SOG_WITH_DEEPMD
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1778,7 +1802,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   double **x = atom->x, *q = atom->q;
 
   // ── GPU path (plugin-internal raw CUDA + cuFFT) ──
-#ifdef SOG_ENABLE_GPU
   if (enable_gpu) {
     ensure_fft_plan();                 // sizes grid + (re)creates plan/green tables on box/grid change
     auto g = (SogGpuState *)gpu_;
@@ -1811,7 +1834,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     for (int j = 0; j < 6; ++j) virial[j] = vv[j];
     return;
   }
-#endif
 
   if (atom->natoms != natoms_original) {
     qsum_qsq();
@@ -1828,6 +1850,12 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
 
   const bool want_energy = (eflag & ENERGY_GLOBAL);
   const bool want_virial = (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR));
+
+  // ── Direct k-space path (exact, no mesh/FFT) ──
+  if (use_direct) {
+    compute_direct(eflag, vflag);
+    return;
+  }
 
   // TEMP validation hook: SOG_DUMP_POT=1 forces v_i computation + one-time dump,
   // so v_i = ∂E_k/∂q_i can be finite-difference validated before the fix exists.
@@ -1860,9 +1888,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   const double volume = mesh_lx * mesh_ly * mesh_lz;
   const double rho_scale =
       static_cast<double>(mesh_nx * mesh_ny * mesh_nz) / volume;
-
-  constexpr int assign_order = kSog_AssignOrder;
-  constexpr int assign_half = (kSog_AssignOrder - 1) / 2;  // = 2
 
   // ── Charge spreading ──
 
@@ -1950,7 +1975,9 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       }
     }
   } else {
-    // Legacy B-spline charge spreading (order 5)
+    // Legacy B-spline charge spreading (order = bspline_order, 4/5/6)
+    const int n1d = bspline_order;
+    const int half = (n1d - 1) / 2;  // = 1 for n=4, 2 for n=5, 2 for n=6
     for (int i = 0; i < nlocal; ++i) {
       const double fx = periodic_fraction(x[i][0], domain->boxlo[0], mesh_lx) *
                         static_cast<double>(mesh_nx);
@@ -1966,24 +1993,21 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
 
-      std::array<double, assign_order> wx, wy, wz;
-      sog_bspline_weights_1d(tx, wx);
-      sog_bspline_weights_1d(ty, wy);
-      sog_bspline_weights_1d(tz, wz);
+      std::vector<double> wx, wy, wz;
+      sog_bspline_weights_1d_order(n1d, tx, wx);
+      sog_bspline_weights_1d_order(n1d, ty, wy);
+      sog_bspline_weights_1d_order(n1d, tz, wz);
 
-      std::array<int, assign_order> ix, iy, iz;
-      for (int a = 0; a < assign_order; ++a) {
-        ix[static_cast<size_t>(a)] =
-            wrap_index(ix0 - assign_half + a, mesh_nx);
-        iy[static_cast<size_t>(a)] =
-            wrap_index(iy0 - assign_half + a, mesh_ny);
-        iz[static_cast<size_t>(a)] =
-            wrap_index(iz0 - assign_half + a, mesh_nz);
+      std::vector<int> ix(n1d), iy(n1d), iz(n1d);
+      for (int a = 0; a < n1d; ++a) {
+        ix[a] = wrap_index(ix0 - half + a, mesh_nx);
+        iy[a] = wrap_index(iy0 - half + a, mesh_ny);
+        iz[a] = wrap_index(iz0 - half + a, mesh_nz);
       }
 
-      for (int a = 0; a < assign_order; ++a) {
-        for (int b = 0; b < assign_order; ++b) {
-          for (int c = 0; c < assign_order; ++c) {
+      for (int a = 0; a < n1d; ++a) {
+        for (int b = 0; b < n1d; ++b) {
+          for (int c = 0; c < n1d; ++c) {
             const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
             mesh_rho[idx] += static_cast<FFT_SCALAR>(rho_scale * q[i] * wx[a] *
                                                       wy[b] * wz[c]);
@@ -2242,7 +2266,9 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       if (want_potential) vpot[i] = qscale * gpot;
     }
   } else {
-    // Legacy B-spline force interpolation
+    // Legacy B-spline force interpolation (order = bspline_order, 4/5/6)
+    const int n1d = bspline_order;
+    const int half = (n1d - 1) / 2;
     for (int i = 0; i < nlocal; ++i) {
       const double fx = periodic_fraction(x[i][0], domain->boxlo[0], mesh_lx) *
                         static_cast<double>(mesh_nx);
@@ -2258,25 +2284,22 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
 
-      std::array<double, assign_order> wx, wy, wz;
-      sog_bspline_weights_1d(tx, wx);
-      sog_bspline_weights_1d(ty, wy);
-      sog_bspline_weights_1d(tz, wz);
+      std::vector<double> wx, wy, wz;
+      sog_bspline_weights_1d_order(n1d, tx, wx);
+      sog_bspline_weights_1d_order(n1d, ty, wy);
+      sog_bspline_weights_1d_order(n1d, tz, wz);
 
-      std::array<int, assign_order> ix, iy, iz;
-      for (int a = 0; a < assign_order; ++a) {
-        ix[static_cast<size_t>(a)] =
-            wrap_index(ix0 - assign_half + a, mesh_nx);
-        iy[static_cast<size_t>(a)] =
-            wrap_index(iy0 - assign_half + a, mesh_ny);
-        iz[static_cast<size_t>(a)] =
-            wrap_index(iz0 - assign_half + a, mesh_nz);
+      std::vector<int> ix(n1d), iy(n1d), iz(n1d);
+      for (int a = 0; a < n1d; ++a) {
+        ix[a] = wrap_index(ix0 - half + a, mesh_nx);
+        iy[a] = wrap_index(iy0 - half + a, mesh_ny);
+        iz[a] = wrap_index(iz0 - half + a, mesh_nz);
       }
 
       double gx = 0.0, gy = 0.0, gz = 0.0;
-      for (int a = 0; a < assign_order; ++a) {
-        for (int b = 0; b < assign_order; ++b) {
-          for (int c = 0; c < assign_order; ++c) {
+      for (int a = 0; a < n1d; ++a) {
+        for (int b = 0; b < n1d; ++b) {
+          for (int c = 0; c < n1d; ++c) {
             const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
             const double w = wx[a] * wy[b] * wz[c];
             gx += w * static_cast<double>(mesh_gradx[2 * idx]);
@@ -2379,6 +2402,293 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   // per-frame per-channel mean), so Σq = 0 and the k=0 Q² cross-term
   // vanishes. This keeps sog.cpp bit-for-bit consistent with the native
   // LAMMPS fastsog.cpp, which has no k=0 correction.
+}
+
+/* ----------------------------------------------------------------------
+   enumerate_direct_kvecs — build half-sphere k-vector list + spectral tables.
+   Called once at init/box-change (like ensure_fft_plan).
+   Follows Ewald::coeffs() pattern: integer Miller indices → Cartesian k,
+   filter by |k| ≤ k_max, exploit half-sphere symmetry.
+   k_max: auto from σ_min (kernel tail < 1e-12) or user-specified direct_kmax.
+------------------------------------------------------------------------- */
+void SOGKSpace::enumerate_direct_kvecs()
+{
+  if (!use_direct) return;
+
+  // Determine σ_min from trained bandwidth
+  double bw_min = bandwidth.empty() ? sigma_param * sigma_param : bandwidth[0];
+  for (size_t m = 0; m < bandwidth.size(); ++m)
+    if (bandwidth[m] < bw_min) bw_min = bandwidth[m];
+  const double sigma_min = std::sqrt(bw_min);
+
+  // k_max: exp(-σ_min²·k²/2) < 1e-12  →  k² > 2·ln(1e12)/σ_min²
+  double kmax;
+  if (direct_kmax > 0.0) {
+    kmax = direct_kmax;
+  } else {
+    kmax = std::sqrt(2.0 * std::log(1.0e12) / bw_min);
+  }
+
+  const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
+  const double dkx = 2.0 * M_PI / lx;
+  const double dky = 2.0 * M_PI / ly;
+  const double dkz = 2.0 * M_PI / lz;
+
+  const int nx_max = static_cast<int>(std::ceil(kmax / dkx));
+  const int ny_max = static_cast<int>(std::ceil(kmax / dky));
+  const int nz_max = static_cast<int>(std::ceil(kmax / dkz));
+
+  const double kmax_sq = kmax * kmax;
+
+  // Count and allocate — first pass for sizing
+  nk_direct = 0;
+  for (int ix = -nx_max; ix <= nx_max; ++ix) {
+    double kx = ix * dkx;
+    for (int iy = -ny_max; iy <= ny_max; ++iy) {
+      double ky = iy * dky;
+      for (int iz = -nz_max; iz <= nz_max; ++iz) {
+        if (ix == 0 && iy == 0 && iz == 0) continue;
+        double kz = iz * dkz;
+        double ksq = kx * kx + ky * ky + kz * kz;
+        if (ksq > kmax_sq) continue;
+        // Half-sphere: keep k where kx > 0, or kx==0 & ky>0, or kx==ky==0 & kz>0
+        if (ix < 0) continue;
+        if (ix == 0 && iy < 0) continue;
+        if (ix == 0 && iy == 0 && iz < 0) continue;
+        ++nk_direct;
+      }
+    }
+  }
+
+  kx_d.resize(nk_direct);   ky_d.resize(nk_direct);   kz_d.resize(nk_direct);
+  ksq_d.resize(nk_direct);  kfac_d.resize(nk_direct);
+  kfac_virial_d.resize(nk_direct);
+
+  // Second pass: fill
+  size_t idx = 0;
+  for (int ix = 0; ix <= nx_max; ++ix) {
+    double kx = ix * dkx;
+    for (int iy = (ix == 0 ? 0 : -ny_max); iy <= ny_max; ++iy) {
+      double ky = iy * dky;
+      int iz_start = (ix == 0 && iy == 0) ? 1 : -nz_max;
+      for (int iz = iz_start; iz <= nz_max; ++iz) {
+        double kz = iz * dkz;
+        double ksq = kx * kx + ky * ky + kz * kz;
+        if (ksq > kmax_sq) continue;
+        kx_d[idx] = ix;  ky_d[idx] = iy;  kz_d[idx] = iz;
+        ksq_d[idx] = ksq;
+        kfac_d[idx] = spectral_kernel(ksq);
+        kfac_virial_d[idx] = spectral_kernel_virial(ksq);
+        ++idx;
+      }
+    }
+  }
+
+  // Precompute per-axis per-atom trig tables (recurrence: cos/sin of integer multiples)
+  int nlocal = atom->nlocal;
+  double **x = atom->x;
+  cs_x.assign((nx_max + 1) * nlocal, 0.0);
+  sn_x.assign((nx_max + 1) * nlocal, 0.0);
+  cs_y.assign((ny_max + 1) * nlocal, 0.0);
+  sn_y.assign((ny_max + 1) * nlocal, 0.0);
+  cs_z.assign((nz_max + 1) * nlocal, 0.0);
+  sn_z.assign((nz_max + 1) * nlocal, 0.0);
+
+  for (int i = 0; i < nlocal; ++i) {
+    double c1x = std::cos(dkx * x[i][0]), s1x = std::sin(dkx * x[i][0]);
+    double c1y = std::cos(dky * x[i][1]), s1y = std::sin(dky * x[i][1]);
+    double c1z = std::cos(dkz * x[i][2]), s1z = std::sin(dkz * x[i][2]);
+
+    cs_x[0 * nlocal + i] = 1.0;  sn_x[0 * nlocal + i] = 0.0;
+    cs_y[0 * nlocal + i] = 1.0;  sn_y[0 * nlocal + i] = 0.0;
+    cs_z[0 * nlocal + i] = 1.0;  sn_z[0 * nlocal + i] = 0.0;
+
+    for (int m = 1; m <= nx_max; ++m) {
+      cs_x[m * nlocal + i] = cs_x[(m-1) * nlocal + i] * c1x - sn_x[(m-1) * nlocal + i] * s1x;
+      sn_x[m * nlocal + i] = sn_x[(m-1) * nlocal + i] * c1x + cs_x[(m-1) * nlocal + i] * s1x;
+    }
+    for (int m = 1; m <= ny_max; ++m) {
+      cs_y[m * nlocal + i] = cs_y[(m-1) * nlocal + i] * c1y - sn_y[(m-1) * nlocal + i] * s1y;
+      sn_y[m * nlocal + i] = sn_y[(m-1) * nlocal + i] * c1y + cs_y[(m-1) * nlocal + i] * s1y;
+    }
+    for (int m = 1; m <= nz_max; ++m) {
+      cs_z[m * nlocal + i] = cs_z[(m-1) * nlocal + i] * c1z - sn_z[(m-1) * nlocal + i] * s1z;
+      sn_z[m * nlocal + i] = sn_z[(m-1) * nlocal + i] * c1z + cs_z[(m-1) * nlocal + i] * s1z;
+    }
+  }
+
+  // Allocate global structure factor arrays
+  sf_re.assign(nk_direct, 0.0);
+  sf_im.assign(nk_direct, 0.0);
+  sf_re_loc.assign(nk_direct, 0.0);
+  sf_im_loc.assign(nk_direct, 0.0);
+
+  if (comm->me == 0) {
+    auto out = (screen ? screen : stdout) ? stdout : nullptr;
+    if (out) {
+      fprintf(out, "SOG direct k-space: kmax=%.4f A^-1  nx/ny/nz_max=%d/%d/%d  "
+              "half-sphere kvecs=%d  mem~%.1f MB\n",
+              kmax, nx_max, ny_max, nz_max, nk_direct,
+              (nk_direct * (sizeof(int)*3 + sizeof(double)*4) +
+               ((nx_max+ny_max+nz_max+3) * nlocal * sizeof(double) * 2)) / (1024.0*1024.0));
+      fflush(out);
+    }
+  }
+}
+
+/* ----------------------------------------------------------------------
+   compute_direct — exact reciprocal-space Ewald sum (no mesh, no FFT).
+   Called from compute_single when use_direct=true.
+   Algorithm:
+     1. Structure factors  S(k) = Σ_i q_i exp(-i k·r_i)  (local only for now)
+     2. MPI_Allreduce → global S_re, S_im
+     3. Energy   E = (qscale/V) · 2 · Σ_{k half} K(k²) · |S(k)|²  − self
+     4. Forces   F_i = q_i · (qscale/V) · 2 · Σ_k K(k²) · k ·
+                       [cos(k·r_i)·S_im[k] − sin(k·r_i)·S_re[k]]
+     5. Virial   from per-atom stress r_i ⊗ F_i
+------------------------------------------------------------------------- */
+void SOGKSpace::compute_direct(int eflag, int vflag)
+{
+  const int nlocal = atom->nlocal;
+  if (nlocal <= 0) { energy = 0.0; return; }
+
+  double **x = atom->x, *q = atom->q, **f = atom->f;
+  const double volume = domain->xprd * domain->yprd * domain->zprd;
+  const double qscale = force->qqrd2e * scale;
+  const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
+  const double dkx = 2.0 * M_PI / lx, dky = 2.0 * M_PI / ly, dkz = 2.0 * M_PI / lz;
+  const double prefac_en = qscale / volume;       // E = (qscale/V)·Σ_{k half} K·|S|²  (×2 from hemisph)
+  const double prefac_f  = -2.0 * qscale / volume; // F_i = q_i·(−2qscale/V)·Σ K·k·(S_im·cos−S_re·sin)
+
+  const bool want_energy = (eflag & ENERGY_GLOBAL);
+  const bool want_virial = (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR));
+
+  // Reset
+  if (want_energy) energy = 0.0;
+  for (int j = 0; j < 6; ++j) virial[j] = 0.0;
+
+  // ── Phase 1: local structure factors ──
+  std::fill(sf_re_loc.begin(), sf_re_loc.end(), 0.0);
+  std::fill(sf_im_loc.begin(), sf_im_loc.end(), 0.0);
+
+  // Note: at this point enumerate_direct_kvecs has been called (in ensure_fft_plan
+  // or init), and the per-axis trig tables have been populated. We access them via:
+  //   cs_x[|kx| * nlocal + i], sn_x[|kx| * nlocal + i]  (similarly y, z)
+  // The sign of kx determines whether to conjugate.
+
+  for (size_t ik = 0; ik < (size_t)nk_direct; ++ik) {
+    int ax = std::abs(kx_d[ik]), ay = std::abs(ky_d[ik]), az = std::abs(kz_d[ik]);
+    double *csx = &cs_x[ax * nlocal], *snx = &sn_x[ax * nlocal];
+    double *csy = &cs_y[ay * nlocal], *sny = &sn_y[ay * nlocal];
+    double *csz = &cs_z[az * nlocal], *snz = &sn_z[az * nlocal];
+
+    // Sign factors for negative Miller indices: cos(−θ)=cos(θ), sin(−θ)=−sin(θ)
+    int sx = (kx_d[ik] >= 0) ? 1 : -1;  // for sine
+    int sy = (ky_d[ik] >= 0) ? 1 : -1;
+    int sz = (kz_d[ik] >= 0) ? 1 : -1;
+
+    double s_re = 0.0, s_im = 0.0;
+    for (int i = 0; i < nlocal; ++i) {
+      double qi = q[i];
+      // cos(k·r) = cc_c - cs_s - sc_s - ss_c  (c=cos, s=sin for each axis)
+      // sin(k·r) = sc_c + cs_c + cc_s - ss_s
+      double cx = csx[i], cy = csy[i], cz = csz[i];
+      double vx = sx * snx[i], vy = sy * sny[i], vz = sz * snz[i];  // signed sines
+
+      double coskr = cx * cy * cz - cx * vy * vz - vx * cy * vz - vx * vy * cz;
+      double sinkr = vx * cy * cz + cx * vy * cz + cx * cy * vz - vx * vy * vz;
+
+      // S(k) = Σ q_i (cos − i·sin)  →  S_re += q·cos, S_im += −q·sin
+      // But we want S_re = Σ q·cos, S_im = Σ q·sin for the force formula
+      s_re += qi * coskr;
+      s_im += qi * sinkr;  // this is −Im[S(k)] in standard notation, but we use it below
+    }
+    sf_re_loc[ik] = s_re;
+    sf_im_loc[ik] = s_im;
+  }
+
+  // ── Phase 2: MPI reduce ──
+  MPI_Allreduce(sf_re_loc.data(), sf_re.data(), nk_direct, MPI_DOUBLE, MPI_SUM, world);
+  MPI_Allreduce(sf_im_loc.data(), sf_im.data(), nk_direct, MPI_DOUBLE, MPI_SUM, world);
+
+  // ── Phase 3: energy + forces + virial ──
+  double etot = 0.0;
+  double vv[6] = {0, 0, 0, 0, 0, 0};
+
+  // Zero local force accumulator
+  std::vector<double> fx(nlocal, 0.0), fy(nlocal, 0.0), fz(nlocal, 0.0);
+
+  for (size_t ik = 0; ik < (size_t)nk_direct; ++ik) {
+    double kfac = kfac_d[ik];
+    if (kfac == 0.0) continue;
+
+    double S_re = sf_re[ik], S_im = sf_im[ik];
+    double Ssq = S_re * S_re + S_im * S_im;
+
+    // Energy
+    if (want_energy) etot += kfac * Ssq;
+
+    // Force contribution: F_i = q_i × prefac × K(k²) × k × [cos(k·r_i)·S_im − sin(k·r_i)·S_re]
+    int ax = std::abs(kx_d[ik]), ay = std::abs(ky_d[ik]), az = std::abs(kz_d[ik]);
+    double *csx = &cs_x[ax * nlocal], *snx = &sn_x[ax * nlocal];
+    double *csy = &cs_y[ay * nlocal], *sny = &sn_y[ay * nlocal];
+    double *csz = &cs_z[az * nlocal], *snz = &sn_z[az * nlocal];
+
+    int sx = (kx_d[ik] >= 0) ? 1 : -1;
+    int sy = (ky_d[ik] >= 0) ? 1 : -1;
+    int sz = (kz_d[ik] >= 0) ? 1 : -1;
+
+    double kx_cart = kx_d[ik] * dkx, ky_cart = ky_d[ik] * dky, kz_cart = kz_d[ik] * dkz;
+    double weight = prefac_f * kfac_d[ik];
+
+    for (int i = 0; i < nlocal; ++i) {
+      double cx = csx[i], cy = csy[i], cz = csz[i];
+      double vx = sx * snx[i], vy = sy * sny[i], vz = sz * snz[i];
+      double coskr = cx * cy * cz - cx * vy * vz - vx * cy * vz - vx * vy * cz;
+      double sinkr = vx * cy * cz + cx * vy * cz + cx * cy * vz - vx * vy * vz;
+
+      double Fi = q[i] * weight * (coskr * S_im - sinkr * S_re);
+      fx[i] += Fi * kx_cart;
+      fy[i] += Fi * ky_cart;
+      fz[i] += Fi * kz_cart;
+    }
+  }
+
+  // Accumulate energy (half-sphere: E = (qscale/V)·Σ_{k half} K·|S|²)
+  if (want_energy) {
+    etot *= prefac_en;
+    // Self-energy subtraction
+    double qsqsum = 0.0;
+    for (int i = 0; i < nlocal; ++i) qsqsum += q[i] * q[i];
+    double qsqsum_all;
+    MPI_Allreduce(&qsqsum, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
+    if (remove_self_interaction)
+      etot -= qscale * self_coeff * qsqsum_all;
+    energy = etot;
+  }
+
+  // Apply forces to atoms (ADD to existing force array)
+  for (int i = 0; i < nlocal; ++i) {
+    f[i][0] += fx[i];
+    f[i][1] += fy[i];
+    f[i][2] += fz[i];
+  }
+
+  // ── Virial: r ⊗ F accumulation ──
+  if (want_virial) {
+    for (int i = 0; i < nlocal; ++i) {
+      vv[0] += x[i][0] * fx[i];
+      vv[1] += x[i][1] * fy[i];
+      vv[2] += x[i][2] * fz[i];
+      vv[3] += x[i][0] * fy[i];
+      vv[4] += x[i][0] * fz[i];
+      vv[5] += x[i][1] * fz[i];
+    }
+    // MPI reduce virial
+    double vv_all[6];
+    MPI_Allreduce(vv, vv_all, 6, MPI_DOUBLE, MPI_SUM, world);
+    for (int j = 0; j < 6; ++j) virial[j] = vv_all[j];
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────

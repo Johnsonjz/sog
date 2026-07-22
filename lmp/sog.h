@@ -69,7 +69,8 @@ class SOGKSpace : public KSpace {
   int mesh_alias_extent;
 
   // ── Spline / grid method selection ──
-  int spline_type;       // 0 = B-spline order 5 (legacy), 4 = CubeS2 4th, 6 = CubeS2 6th
+  int spline_type;       // 0 = B-spline (legacy; order in bspline_order), 4 = CubeS2 4th, 6 = CubeS2 6th
+  int bspline_order = 5; // B-spline order when spline_type == 0 (4, 5, or 6)
   bool is_quads = false; // false = CubeS₂ (non-separable); true = QuadS (separable, Form-A)
   int grid_method;       // 0 = SOG bandwidth (new), 1 = PPPM iteration (legacy)
   double phi_max_user;   // user-specified φ_max override (>0 means active, −1 = auto)
@@ -122,6 +123,19 @@ class SOGKSpace : public KSpace {
   std::vector<double> cubes2_influence_im;  // Im[Φ(k)]
   std::vector<double> cubes2_influence_sq;  // |Φ(k)|²
 
+  // ── Direct k-space mode (exact reference, no mesh/FFT) ──
+  bool use_direct = false;                  // gate: route compute_single to compute_direct
+  double direct_kmax = -1.0;                // k_max in Å⁻¹ for direct k-vector sphere
+  int nk_direct = 0;                        // actual half-sphere k-vector count
+  std::vector<int> kx_d, ky_d, kz_d;        // Miller indices (half-sphere)
+  std::vector<double> ksq_d;                // k_cart² per k-vector
+  std::vector<double> kfac_d;               // K(k²) per k-vector
+  std::vector<double> kfac_virial_d;        // K_v(k²) = Σ a_m·β_m·exp(-½β_m·k²)
+  std::vector<double> cs_x, cs_y, cs_z;     // per-atom cos(k·r_i) by axis, per k, per atom
+  std::vector<double> sn_x, sn_y, sn_z;     // per-atom sin(k·r_i) by axis, per k, per atom
+  std::vector<double> sf_re, sf_im;         // global structure factor per k (after MPI)
+  std::vector<double> sf_re_loc, sf_im_loc; // local contribution (pre-reduce)
+
   // ── Methods ──
   void finalize_kernel_parameters();
   void finalize_virial_parameters();
@@ -132,6 +146,10 @@ class SOGKSpace : public KSpace {
   void precompute_sinc_tables();
   void precompute_cubes2_influence();
   void precompute_green_functions();
+
+  // Direct k-space mode
+  void enumerate_direct_kvecs();
+  void compute_direct(int eflag, int vflag);
 
   size_t mesh_index(int ix, int iy, int iz) const;
   double periodic_fraction(double x, double xlo, double prd) const;

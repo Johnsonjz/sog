@@ -37,13 +37,26 @@ XI0 = {4: 0.5773502691896258, 6: 0.6503998764035732}
 # the bisection anchors (calibrate_phi_max_anchors.py, phi_max_anchors.json) with p FIXED at 2nu,
 # taking the MEDIAN C over a panel of random SOG kernels x random charge configurations.
 #
+# **CubeS₂ (Form B) vs QuadS (Form A) — separate C_nu (§9.5 / Table 9.3).** The law captures the
+# *combined* charge-spreading + Green-function error. For CubeS₂ (Form B), the variance-subtraction
+# Green function contributes a leading O(Δ^{2ν}) term, so C_nu ≳ 10⁻². For QuadS (Form A), the exact
+# window-influence division K/|Ŵ|² eliminates this term entirely — only bare charge-spreading
+# interpolation error remains, giving C_nu ~2×10⁻⁴ (100–500× smaller). The constants below are
+# calibrated from the python FFT ε-ladder sweep on random water-like systems (n_dl=0.5 reference):
+#   - CubeS₂  (Form B): pooled-median bisection (calibrate_phi_max_anchors.py)
+#   - QuadS   (Form A): upper-bound from measured F_rel ≤ 1×10⁻⁴ at all grids (Δ/σ_min ≤ 0.95);
+#     true C likely smaller but our n_dl=0.5 reference cannot resolve below ~9×10⁻⁵.
+#
 # Force-rel is canonical: it is what MD is driven by, it matches the C++ auto-derive (sog.cpp), and it
 # is the metric where the single-parameter (Delta/sigma_min) law collapses (CV ~5% across kernels;
 # energy-rel scatters 15-30% and floors out).  The old back-fit (p ~3.96/6.53, C tuned to reproduce
 # phi=0.10 at eps=1e-4) was optimistic ~30x in force-rel; the true force-rel at phi=0.10 (order-6 cons)
 # is ~2e-3.  With honest p=2nu, the median-refit C gives phi(eps=1e-4) = 0.032 (order-4) / 0.066
-# (order-6) on the cons kernel (sigma_min=0.750 A).  Refit date: 2026-07-13.
-FALLBACK_LAW = {4: {"p": 4, "C": 4.953e-2}, 6: {"p": 6, "C": 1.377e-2}}
+# (order-6) on the cons kernel (sigma_min=0.750 A).  Refit date: 2026-07-13; split date: 2026-07-22.
+CUBES2_LAW = {4: {"p": 4, "C": 4.953e-2}, 6: {"p": 6, "C": 1.377e-2}}
+QUADS_LAW  = {4: {"p": 4, "C": 2.0e-4},  6: {"p": 6, "C": 2.0e-4}}
+# Legacy alias — kept for backward compatibility; new code should use the spline-specific dicts.
+FALLBACK_LAW = CUBES2_LAW
 
 
 def sigma_min_of(bandwidth):

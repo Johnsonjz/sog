@@ -1,0 +1,55 @@
+To get the best performance, it is recommended to adjust the number of threads by setting the environment variables OMP_NUM_THREADS, DP_INTRA_OP_PARALLELISM_THREADS, and DP_INTER_OP_PARALLELISM_THREADS. See https://deepmd.rtfd.io/parallelism/ for more information.
+[2026-07-16 02:10:55,613] DEEPMD INFO    DeePMD version: 0.1.dev3645+g895cce1a6.d20260411
+[2026-07-16 02:10:55,613] DEEPMD INFO    Configuration path: input_dpa.json
+[2026-07-16 02:10:55,640] DEEPMD INFO     _____               _____   __  __  _____           _     _  _   
+[2026-07-16 02:10:55,640] DEEPMD INFO    |  __ \             |  __ \ |  \/  ||  __ \         | |   (_)| |  
+[2026-07-16 02:10:55,640] DEEPMD INFO    | |  | |  ___   ___ | |__) || \  / || |  | | ______ | | __ _ | |_ 
+[2026-07-16 02:10:55,640] DEEPMD INFO    | |  | | / _ \ / _ \|  ___/ | |\/| || |  | ||______|| |/ /| || __|
+[2026-07-16 02:10:55,640] DEEPMD INFO    | |__| ||  __/|  __/| |     | |  | || |__| |        |   < | || |_ 
+[2026-07-16 02:10:55,640] DEEPMD INFO    |_____/  \___| \___||_|     |_|  |_||_____/         |_|\_\|_| \__|
+[2026-07-16 02:10:55,640] DEEPMD INFO    Please read and cite:
+[2026-07-16 02:10:55,641] DEEPMD INFO    Wang, Zhang, Han and E, Comput.Phys.Comm. 228, 178-184 (2018)
+[2026-07-16 02:10:55,641] DEEPMD INFO    Zeng et al, J. Chem. Phys., 159, 054801 (2023)
+[2026-07-16 02:10:55,641] DEEPMD INFO    Zeng et al, J. Chem. Theory Comput., 21, 4375-4385 (2025)
+[2026-07-16 02:10:55,641] DEEPMD INFO    See https://deepmd.rtfd.io/credits/ for details.
+[2026-07-16 02:10:55,641] DEEPMD INFO    --------------------------------------------------------------------------
+[2026-07-16 02:10:55,641] DEEPMD INFO    Installed to:         /root/code/deepmd-kit/deepmd
+[2026-07-16 02:10:55,641] DEEPMD INFO                          /root/miniconda3/lib/python3.12/site-packages/deepmd
+[2026-07-16 02:10:55,641] DEEPMD INFO    Source:               
+[2026-07-16 02:10:55,641] DEEPMD INFO    Source Branch:        sog_devel
+[2026-07-16 02:10:55,641] DEEPMD INFO    Source Commit:        895cce1a
+[2026-07-16 02:10:55,641] DEEPMD INFO    Source Commit at:     2026-04-12 00:11:40 +0800
+[2026-07-16 02:10:55,641] DEEPMD INFO    Float Precision:      Double
+[2026-07-16 02:10:55,641] DEEPMD INFO    Build Variant:        CPU
+[2026-07-16 02:10:55,641] DEEPMD INFO    Backend:              PyTorch
+[2026-07-16 02:10:55,641] DEEPMD INFO    PT Ver:               v2.11.0+cu128-g70d99e998b4
+[2026-07-16 02:10:55,641] DEEPMD INFO    Custom OP Enabled:    False
+[2026-07-16 02:10:55,641] DEEPMD INFO    Running on:           di-20260410100103-pkvss
+[2026-07-16 02:10:55,641] DEEPMD INFO    Computing Device:     CUDA:0
+[2026-07-16 02:10:55,641] DEEPMD INFO    Device Name:          NVIDIA A800-SXM4-80GB
+[2026-07-16 02:10:55,641] DEEPMD INFO    CUDA_VISIBLE_DEVICES: unset
+[2026-07-16 02:10:55,641] DEEPMD INFO    Visible GPU Count:    1
+[2026-07-16 02:10:55,641] DEEPMD INFO    Num Intra Threads:    0
+[2026-07-16 02:10:55,641] DEEPMD INFO    Num Inter Threads:    0
+[2026-07-16 02:10:55,641] DEEPMD INFO    --------------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/root/miniconda3/bin/dp_dev", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/root/code/deepmd-kit/deepmd/main.py", line 1058, in main
+    deepmd_main(args)
+  File "/root/miniconda3/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/root/code/deepmd-kit/deepmd/pt/entrypoints/main.py", line 570, in main
+    train(
+  File "/root/code/deepmd-kit/deepmd/pt/entrypoints/main.py", line 284, in train
+    config = j_loader(input_file)
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/root/code/deepmd-kit/deepmd/common.py", line 181, in j_loader
+    with filepath.open() as fp:
+         ^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'input_dpa.json'
