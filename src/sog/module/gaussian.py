@@ -130,8 +130,6 @@ class Gaussian(nn.Module):
             "kernel_tensor_mode",
         )
 
-        self.self_coeff = 0.0  # real-space self-energy (fastsog convention)
-
         if n_dl is not None:
             n_dl_value = float(n_dl)
             if (not math.isfinite(n_dl_value)) or n_dl_value <= 0.0:
@@ -207,17 +205,13 @@ class Gaussian(nn.Module):
                 for mm in range(2, m_value):
                     amp_tensor[mm] = amp_tensor[mm - 1] * b2
 
-                # Real-space self-energy (fastsog.cpp line 544-551)
-                sum_b_inv = 0.0
-                for mm in range(1, m_value):
-                    sum_b_inv += float(b) ** (-mm)
-                self.self_coeff = (logb / (math.sqrt(2.0 * math.pi) * sigma)) * (w0 + sum_b_inv)
+                # Self-energy handled unconditionally via diag_sum (matching Ewald convention)
+
             else:
                 coef1 = float(4.0 * math.pi * math.log(float(b)))
                 amp_tensor = torch.full_like(bw2, fill_value=coef1)
         else:
             amp_tensor = _as_1d_tensor_keep_input(amp)
-            self.self_coeff = 0.0
         if amp_tensor.numel() == 0:
             raise ValueError("`amp` should not be empty.")
         if not torch.isfinite(amp_tensor).all():
@@ -609,8 +603,6 @@ class Gaussian(nn.Module):
                             b=self.b,
                             xi=_get_xi(self.cubes2_order),
                             order=self.cubes2_order,
-                            remove_self_interaction=self.remove_self_interaction,
-                            self_coeff=self.self_coeff,
                             norm_factor=self.norm_factor,
                             compute_force=True,
                             compute_virial=compute_virial,
@@ -641,8 +633,6 @@ class Gaussian(nn.Module):
                             self.b,
                             self.cubes2_order,
                             _get_xi(self.cubes2_order),
-                            self.remove_self_interaction,
-                            self.self_coeff,
                             self.norm_factor,
                         )
                         pot_now += e_ch
@@ -684,8 +674,6 @@ class Gaussian(nn.Module):
                         r_c=self.rcut,
                         b=self.b,
                         order=self.quads_order,
-                        remove_self_interaction=self.remove_self_interaction,
-                        self_coeff=self.self_coeff,
                         norm_factor=self.norm_factor,
                         compute_force=need_force,
                         compute_virial=compute_virial,
@@ -712,11 +700,8 @@ class Gaussian(nn.Module):
                     need_virial=compute_virial,
                 )
 
-                if self.remove_self_interaction:
-                    pot_now = pot_now - torch.sum(q_now * q_now) * state["diag_sum"]
-                # Real-space self-energy (fastsog convention)
-                if self.self_coeff != 0.0:
-                    pot_now = pot_now - torch.sum(q_now * q_now) * self.self_coeff
+                # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
+                pot_now = pot_now - torch.sum(q_now * q_now) * state["diag_sum"]
 
                 pot_now = pot_now * self.norm_factor
                 force_now = force_now * self.norm_factor
@@ -748,49 +733,8 @@ class Gaussian(nn.Module):
                 if virial_list is not None:
                     virial_list.append(torch.zeros((3, 3), dtype=r.dtype, device=r.device))
 
-            # ── Physical k=0 correction (all paths: direct, FFT, NUFFT) ──
-            # k=0 is excluded in ALL paths → add it back.
-            # Charge term (always on): A·Q²/(2V) — physical cross-term.
-            # Self term (tied to remove_self_interaction): −A·Σq_i²/(2V).
-            #
-            # IMPORTANT: Do NOT use raw amp_sum = Σ_m amp_m for k=0 kernel value.
-            # amp[m] grows as b^(2m) (geometric growth, e.g. 2.17e6 for M=12).
-            # At k=0, exp(−½ bw²·0) = 1 for ALL m → dominated by high-m "inactive" terms.
-            # At any finite k (even the smallest on the grid), exp decay suppresses
-            # high-m terms, giving kfac ≈ 4π/k² consistent with Coulomb physics.
-            # The raw amp_sum at k=0 is a numerical artifact of the parameterization.
-            #
-            # Fix: evaluate the SOG kernel at the smallest physical |k| determined
-            # by the reciprocal lattice vectors: k_min = min(|b1|, |b2|, |b3|).
-            #   b_i = 2π · (a_j × a_k) / volume
-            # This handles both orthorhombic and triclinic boxes correctly.
-            # Gives kfac_eff ≈ Σ_m amp_m·exp(−½ bw²_m · k_min²), consistent
-            # with the k≠0 energy (same kernel, same convention).
-            if periodic and box_now is not None:
-                amp = self.amp.to(dtype=q_now.dtype, device=q_now.device)
-                bw2 = self.bandwidth.to(dtype=q_now.dtype, device=q_now.device)
-                # Minimum non-zero k-vector magnitude from reciprocal lattice.
-                # For orthorhombic: k_min = 2π / max(Lx, Ly, Lz).
-                a1, a2, a3 = box_now[0], box_now[1], box_now[2]
-                b1 = 2.0 * math.pi * torch.linalg.cross(a2, a3) / volume
-                b2 = 2.0 * math.pi * torch.linalg.cross(a3, a1) / volume
-                b3 = 2.0 * math.pi * torch.linalg.cross(a1, a2) / volume
-                k_min_sq = torch.min(torch.stack([
-                    torch.dot(b1, b1),
-                    torch.dot(b2, b2),
-                    torch.dot(b3, b3),
-                ]))
-                # Effective k=0 kernel value (regularized)
-                kfac_eff = (amp * torch.exp(-0.5 * bw2 * k_min_sq)).sum()
-
-                q_sum = q_now.sum()          # total charge (sum over atoms + channels)
-                e_k0_charge = kfac_eff * (q_sum ** 2) / (2.0 * volume) * self.norm_factor
-                pot_now = pot_now + e_k0_charge
-
-                if self.remove_self_interaction:
-                    q_sq_sum = (q_now ** 2).sum()
-                    e_k0_self = -kfac_eff * q_sq_sum / (2.0 * volume) * self.norm_factor
-                    pot_now = pot_now + e_k0_self
+            # k=0: identically zero for charge-neutral systems (Q=0), matching Ewald convention.
+            # The charge_neutral_lambda soft penalty (below) is optional additional regularization.
 
             # Optional user override penalty (additional regularization):
             if self.charge_neutral_lambda is not None and self.charge_neutral_lambda > 0:
@@ -837,10 +781,6 @@ class Gaussian(nn.Module):
 
         pair_q = q.unsqueeze(0) * q.unsqueeze(1)
         pot = 0.5 * torch.sum(pair_q * kernel.unsqueeze(-1))
-
-        if not self.remove_self_interaction:
-            k0 = amp.sum()
-            pot = pot + 0.5 * torch.sum(q * q) * k0
 
         return pot * self.norm_factor
 
@@ -895,11 +835,8 @@ class Gaussian(nn.Module):
                 state["k_mode_mask"],
             )
 
-        if self.remove_self_interaction:
-            pot = pot - torch.sum(state["q"] * state["q"]) * state["diag_sum"]
-        # Real-space self-energy (fastsog convention)
-        if self.self_coeff != 0.0:
-            pot = pot - torch.sum(state["q"] * state["q"]) * self.self_coeff
+        # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
+        pot = pot - torch.sum(state["q"] * state["q"]) * state["diag_sum"]
 
         return pot * self.norm_factor
 
@@ -1251,28 +1188,10 @@ class Gaussian(nn.Module):
         q_sq_sum = (q_f * q_f).sum(dim=(1, 2))                        # [nf]
 
         pot = e_recip
-        if self.remove_self_interaction:
-            pot = pot - q_sq_sum * diag_sum
-        if self.self_coeff != 0.0:
-            pot = pot - q_sq_sum * self.self_coeff
+        pot = pot - q_sq_sum * diag_sum
         pot = pot * self.norm_factor
 
-        # ── physical k=0 correction (regularized k_min from reciprocal lattice) ──
-        a1, a2, a3 = cell[:, 0], cell[:, 1], cell[:, 2]
-        vol_c = volume.unsqueeze(1)
-        b1 = two_pi * torch.linalg.cross(a2, a3, dim=1) / vol_c
-        b2 = two_pi * torch.linalg.cross(a3, a1, dim=1) / vol_c
-        b3 = two_pi * torch.linalg.cross(a1, a2, dim=1) / vol_c
-        k_min_sq = torch.stack(
-            [(b1 * b1).sum(1), (b2 * b2).sum(1), (b3 * b3).sum(1)], dim=1
-        ).min(dim=1).values                                          # [nf]
-        amp0 = self.amp.to(dtype=dtype, device=device).view(1, -1)
-        bw0 = self.bandwidth.to(dtype=dtype, device=device).view(1, -1)
-        kfac_eff = (amp0 * torch.exp(-0.5 * bw0 * k_min_sq.unsqueeze(1))).sum(dim=1)  # [nf]
-        q_sum = q_f.sum(dim=(1, 2))                                   # [nf]
-        pot = pot + kfac_eff * q_sum.square() * inv2v * self.norm_factor
-        if self.remove_self_interaction:
-            pot = pot - kfac_eff * q_sq_sum * inv2v * self.norm_factor
+        # k=0: identically zero for charge-neutral systems (Q=0), matching Ewald convention.
         if self.charge_neutral_lambda is not None and self.charge_neutral_lambda > 0:
             _q_mean = (q_f.sum(dim=(1, 2)) / (_nloc_tensor if _nloc_tensor is not None else _nloc_max)).unsqueeze(1)  # [nf,1]
             pot = pot + float(self.charge_neutral_lambda) * (_q_mean ** 2).sum(dim=1)

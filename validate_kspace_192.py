@@ -42,13 +42,6 @@ def py_direct_ef(g, coords, q, want_force=True):
     return float(E), F.detach().numpy()
 
 
-def k0_self(q):
-    """Python direct includes a k=0 term; C++ elong is k!=0 only. Neutral -> only the self term."""
-    kmin2 = (2.0 * np.pi / BOX) ** 2
-    kfac = float((AMP * np.exp(-0.5 * BW * kmin2)).sum())
-    return -kfac * float(np.sum(q ** 2)) / (2.0 * VOL) * NORM
-
-
 def parse_traj(path):
     frames, f = [], open(path)
     lines = f.read().splitlines(); i = 0
@@ -89,9 +82,8 @@ def compare(order, tag, stride=10):
     relE, relF, maxdF = [], [], []
     for k in idx:
         coords, q, fcpp, _typ = frames[k]
-        e0 = k0_self(q)
         Epy, Fpy = py_direct_ef(g, coords, q)
-        Epy_kneq0 = Epy - e0
+        Epy_kneq0 = Epy  # k=0 is zero for neutral systems (removed from both Python and C++)
         relE.append(abs(Epy_kneq0 - elong[k]) / abs(elong[k]))
         df = Fpy - fcpp
         relF.append(np.linalg.norm(df) / (np.linalg.norm(fcpp) + 1e-30))

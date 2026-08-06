@@ -1601,24 +1601,16 @@ void SOGKSpace::apply_k0_correction_single_channel(int eflag, int vflag) {
   MPI_Allreduce(&qsum_local, &qsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
   MPI_Allreduce(&qsqsum_local, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
 
+  // Regularized k=0 kernel: evaluate at smallest physical |k| to suppress
+  // high-m terms whose Gaussians are too wide to resolve real structure.
+  // Matches Python sog-lib gaussian.py k=0 correction.  k_min = 2π/max(Lx,Ly,Lz)
+  // for orthorhombic (the only box type currently supported).
   double kfac_eff = 0.0;
   {
-    double Lx = domain->xprd, Ly = domain->yprd, Lz = domain->zprd;
-    double k_min_sq;
-    if (domain->triclinic) {
-      double xy = domain->xy, xz_d = domain->xz, yz = domain->yz;
-      double Vcell = Lx * Ly * Lz;
-      double twopi_over_V = 2.0 * MY_PI / Vcell;
-      double b1_sq = (Ly*Lz)*(Ly*Lz) + (xy*Lz)*(xy*Lz) + (xy*yz - Ly*xz_d)*(xy*yz - Ly*xz_d);
-      b1_sq *= twopi_over_V * twopi_over_V;
-      double b2_sq = Lx*Lx * (Lz*Lz + yz*yz);
-      b2_sq *= twopi_over_V * twopi_over_V;
-      double b3_sq = Lx*Lx * Ly*Ly * twopi_over_V * twopi_over_V;
-      k_min_sq = std::min({b1_sq, b2_sq, b3_sq});
-    } else {
-      double L_max = std::max({Lx, Ly, Lz});
-      k_min_sq = (2.0 * MY_PI / L_max) * (2.0 * MY_PI / L_max);
-    }
+    const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
+    const double longest = std::max({lx, ly, lz});
+    const double k_min_sq =
+        (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
     for (size_t m = 0; m < amp.size(); ++m)
       kfac_eff += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
   }
@@ -1626,32 +1618,24 @@ void SOGKSpace::apply_k0_correction_single_channel(int eflag, int vflag) {
   const double volume = mesh_lx * mesh_ly * mesh_lz;
   const double qscale = force->qqrd2e * scale;
 
-  // Energy correction
+  // Energy correction: E_k0 = qscale * K(0) * Q² / (2V)
+  // The self-energy (Σq² term) is already removed by the mesh-level rsi
+  // correction in sog_gpu_compute / CPU kspace.  Only the Q² cross-term
+  // needs explicit removal here.  When Q=0 (charge_neutral model) the
+  // correction is naturally zero as well.
   if (eflag & ENERGY_GLOBAL) {
-    energy += qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume);
-    if (comm->me == 0) {
-      std::string msg = fmt::format(
-          "  SOG k0 Q² (1-ch): Q={:.6e} dE={:.6e}\n",
-          qsum_all, qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume));
-      utils::logmesg(lmp, msg);
-    }
+    double dE = qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume);
+    energy += dE;
+    // (debug message removed — uncomment for diagnostics)
   }
 
   // Virial correction: W_diag = E_k0_cross for isotropic E∝1/V
   if (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR)) {
     double k0_cross = qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume);
-    // Also add self-term removal if remove_self_interaction is set
-    if (remove_self_interaction) {
-      k0_cross -= qscale * kfac_eff * qsqsum_all / (2.0 * volume);
-    }
     virial[0] += k0_cross;
     virial[1] += k0_cross;
     virial[2] += k0_cross;
-    if (comm->me == 0) {
-      std::string msg = fmt::format(
-          "  SOG k0 virial Q² (1-ch): dW_diag={:.6e}\n", k0_cross);
-      utils::logmesg(lmp, msg);
-    }
+    // (debug message removed — uncomment for diagnostics)
   }
 }
 
@@ -1659,25 +1643,14 @@ void SOGKSpace::apply_k0_correction_multi_channel(
     double &energy_acc, double virial_acc[6],
     int eflag, int vflag,
     double qsum_total, double qsqsum_total) {
-  // Compute kfac_eff (same as compute_single)
+  // Regularized k=0 kernel: evaluate at smallest physical |k| (see
+  // apply_k0_correction_single_channel for rationale).
   double kfac_eff = 0.0;
   {
-    double Lx = domain->xprd, Ly = domain->yprd, Lz = domain->zprd;
-    double k_min_sq;
-    if (domain->triclinic) {
-      double xy = domain->xy, xz_d = domain->xz, yz = domain->yz;
-      double Vcell = Lx * Ly * Lz;
-      double twopi_over_V = 2.0 * MY_PI / Vcell;
-      double b1_sq = (Ly*Lz)*(Ly*Lz) + (xy*Lz)*(xy*Lz) + (xy*yz - Ly*xz_d)*(xy*yz - Ly*xz_d);
-      b1_sq *= twopi_over_V * twopi_over_V;
-      double b2_sq = Lx*Lx * (Lz*Lz + yz*yz);
-      b2_sq *= twopi_over_V * twopi_over_V;
-      double b3_sq = Lx*Lx * Ly*Ly * twopi_over_V * twopi_over_V;
-      k_min_sq = std::min({b1_sq, b2_sq, b3_sq});
-    } else {
-      double L_max = std::max({Lx, Ly, Lz});
-      k_min_sq = (2.0 * MY_PI / L_max) * (2.0 * MY_PI / L_max);
-    }
+    const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
+    const double longest = std::max({lx, ly, lz});
+    const double k_min_sq =
+        (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
     for (size_t m = 0; m < amp.size(); ++m)
       kfac_eff += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
   }
@@ -1685,34 +1658,24 @@ void SOGKSpace::apply_k0_correction_multi_channel(
   const double volume = mesh_lx * mesh_ly * mesh_lz;
   const double qscale = force->qqrd2e * scale;
 
-  // Energy correction: Q² cross term using TOTAL charge
+  // Energy correction: E_k0 = qscale * K(0) * [Q² - (rsi)Σq²] / (2V)
+  // The self-energy (Σq² term) is already removed by the mesh-level rsi
+  // correction in sog_gpu_compute / CPU kspace.  Only the Q² cross-term
+  // needs explicit removal here.  When Q=0 (charge_neutral model) the
+  // correction is naturally zero as well.
   if (eflag & ENERGY_GLOBAL) {
     double dE = qscale * kfac_eff * qsum_total * qsum_total / (2.0 * volume);
     energy_acc += dE;
-    if (comm->me == 0) {
-      std::string msg = fmt::format(
-          "  SOG k0 Q² (multi-ch): Q_total={:.6e} dE={:.6e}\n",
-          qsum_total, dE);
-      utils::logmesg(lmp, msg);
-    }
+    // (debug message removed — uncomment for diagnostics)
   }
 
   // Virial correction
   if (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR)) {
     double k0_cross = qscale * kfac_eff * qsum_total * qsum_total / (2.0 * volume);
-    // Self-term for multi-channel: qsqsum_total is the sum across channels
-    if (remove_self_interaction) {
-      k0_cross -= qscale * kfac_eff * qsqsum_total / (2.0 * volume);
-    }
     virial_acc[0] += k0_cross;
     virial_acc[1] += k0_cross;
     virial_acc[2] += k0_cross;
-    if (comm->me == 0) {
-      std::string msg = fmt::format(
-          "  SOG k0 virial Q² (multi-ch): Q_total={:.6e} dW_diag={:.6e}\n",
-          qsum_total, k0_cross);
-      utils::logmesg(lmp, msg);
-    }
+    // (debug message removed — uncomment for diagnostics)
   }
 }
 
@@ -1732,8 +1695,10 @@ void SOGKSpace::compute(int eflag, int vflag) {
   // ── Single-channel: use atom->q directly ──
   if (nchannels <= 1) {
     compute_single(eflag, vflag);
-    // NOTE: k=0 Q² cross-term is NOT applied. The training SOG kernel
-    // skips k=0, so the model was trained without this contribution.
+    // k=0 Q² cross-term: when charge_neutral=false, the training SOG kernel
+    // includes k=0, so the MD kspace must match. For neutral systems Q≈0
+    // and the correction is zero — safe to apply unconditionally.
+    apply_k0_correction_single_channel(eflag, vflag);
     return;
   }
 
@@ -1747,6 +1712,19 @@ void SOGKSpace::compute(int eflag, int vflag) {
     f_orig[i][1] = atom->f[i][1];
     f_orig[i][2] = atom->f[i][2];
   }
+
+  // Compute total charge across all channels for k=0 correction
+  double qsum_total = 0.0, qsqsum_total = 0.0;
+  for (int i = 0; i < nlocal; ++i) {
+    double qi_total = 0.0;
+    for (int ch = 0; ch < nchannels; ++ch)
+      qi_total += pair_dp->dcharge_multi[i * nchannels + ch];
+    qsum_total += qi_total;
+    qsqsum_total += qi_total * qi_total;
+  }
+  double qsum_global = 0.0, qsqsum_global = 0.0;
+  MPI_Allreduce(&qsum_total, &qsum_global, 1, MPI_DOUBLE, MPI_SUM, world);
+  MPI_Allreduce(&qsqsum_total, &qsqsum_global, 1, MPI_DOUBLE, MPI_SUM, world);
 
   // Set atom->q to sum of all channels (total effective charge)
   for (int i = 0; i < nlocal; ++i)
@@ -1762,15 +1740,13 @@ void SOGKSpace::compute(int eflag, int vflag) {
   }
 
   // Run single-channel kspace with combined charges
-  // NOTE: k=0 Q² cross-term is NOT applied — training SOG kernel skips k=0.
   compute_single(eflag, vflag);
 
-  if (comm->me == 0) {
-    std::string msg = fmt::format(
-        "  SOG multi-ch collapsed ({}ch): energy={:.6e} virial=[{:.4e} {:.4e} {:.4e} {:.4e} {:.4e} {:.4e}]\n",
-        nchannels, energy, virial[0], virial[1], virial[2], virial[3], virial[4], virial[5]);
-    utils::logmesg(lmp, msg);
-  }
+  // Apply k=0 Q² correction using total charge across all channels
+  // (charge_neutral=false training includes k=0; paper Eq. 3.4)
+  apply_k0_correction_multi_channel(energy, virial, eflag, vflag,
+                                    qsum_global, qsqsum_global);
+  // (debug message removed — uncomment for diagnostics)
 
   // Accumulate kspace forces (preserving original pair forces)
   for (int i = 0; i < nlocal; ++i) {
@@ -1818,6 +1794,11 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       xx[i * 3 + 2] = x[i][2];
     }
     if (want_potential) vpot.assign(nlocal, 0.0);
+
+    // Charge-neutral mean subtraction is handled by the model's
+    // forward_lower_energy_charge (latent_charge = q - mean(q) per frame).
+    // The charges arriving at atom->q are already zero-mean.
+
     double qsqsum_gpu = 0.0;
     for (int i = 0; i < nlocal; ++i) qsqsum_gpu += q[i] * q[i];
     // (single-rank isolated kspace; MPI-reduce qsqsum when this path goes multi-rank)
@@ -1831,9 +1812,35 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       fx[i][1] += fk[i * 3 + 1];
       fx[i][2] += fk[i * 3 + 2];
     }
+
+    // ── k=0 contribution to per-atom potential v_i = ∂E_k0/∂q_i (GPU path) ──
+    // Only the cross-term ∂(Q²)/∂q_i = 2Q is needed; the self-energy
+    // derivative is already covered by the mesh rsi correction in
+    // sog_gpu_compute.  When Q=0 the correction is naturally zero.
+    if (want_potential) {
+      double qsum_local = 0.0;
+      for (int i = 0; i < nlocal; ++i) qsum_local += q[i];
+      double Q_total = 0.0;
+      MPI_Allreduce(&qsum_local, &Q_total, 1, MPI_DOUBLE, MPI_SUM, world);
+      const double volume = lx * ly * lz;
+      const double longest = std::max({lx, ly, lz});
+      const double k_min_sq =
+          (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
+      double kf = 0.0;
+      for (size_t m = 0; m < amp.size(); ++m)
+        kf += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
+      const double dv_perQ = qscale * kf / volume;
+      for (int i = 0; i < nlocal; ++i) {
+        vpot[i] += dv_perQ * Q_total;
+      }
+    }
     for (int j = 0; j < 6; ++j) virial[j] = vv[j];
     return;
   }
+
+  // Charge-neutral mean subtraction is handled by the model's
+  // forward_lower_energy_charge (latent_charge = q - mean(q) per frame).
+  // The charges arriving at atom->q are already zero-mean.
 
   if (atom->natoms != natoms_original) {
     qsum_qsq();
@@ -2356,6 +2363,29 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     for (int i = 0; i < nlocal; ++i) {
       vpot[i] -= qscale * q[i] * (rsi_coef + self_c);
     }
+
+    // ── k=0 contribution to per-atom potential v_i = ∂E_k0/∂q_i ──
+    // E_k0 = qscale · kfac_eff · [Q² − rsi·Σq_j²] / (2V)
+    //   → v_i^{k0} = qscale · kfac_eff · [Q − rsi·q_i] / V
+    // Uses the SAME regularized kfac_eff as apply_k0_correction_single_channel.
+    {
+      double qsum_local_p = 0.0;
+      for (int i = 0; i < nlocal; ++i) qsum_local_p += q[i];
+      double Q_total = 0.0;
+      MPI_Allreduce(&qsum_local_p, &Q_total, 1, MPI_DOUBLE, MPI_SUM, world);
+      const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
+      const double longest = std::max({lx, ly, lz});
+      const double k_min_sq =
+          (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
+      double kf = 0.0;
+      for (size_t m = 0; m < amp.size(); ++m)
+        kf += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
+      const double dv_perQ = qscale * kf / volume;
+      for (int i = 0; i < nlocal; ++i) {
+        vpot[i] += dv_perQ * Q_total;
+      }
+    }
+
     if (getenv("SOG_DUMP_POT") && comm->me == 0) {
       utils::logmesg(lmp, fmt::format(
           "  SOG vpot: tag[0]={} v[0]={:.10e}  tag[1]={} v[1]={:.10e}  "

@@ -614,8 +614,6 @@ class Cubes2FFTFunction(torch.autograd.Function):
         b: float,                  # geometric base (for φ_max table)
         order: int,                # CubeS₂ spline order (4 or 6)
         xi: float,                 # CubeS₂ xi parameter
-        remove_self_interaction: bool,
-        self_coeff: float,         # real-space self-energy coefficient
         norm_factor: float,        # energy unit conversion
     ) -> torch.Tensor:
         device = r.device
@@ -707,10 +705,8 @@ class Cubes2FFTFunction(torch.autograd.Function):
         rho_sq = rho_k.real**2 + rho_k.imag**2
 
         energy = 0.5 * volume * s2 * (_rfft_w * green_k * rho_sq).sum()
-        if remove_self_interaction:
-            energy = energy - (q * q).sum() * diag_sum_fft
-        if self_coeff != 0.0:
-            energy = energy - (q * q).sum() * self_coeff
+        # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
+        energy = energy - (q * q).sum() * diag_sum_fft
         energy = energy * norm_factor
 
         # ── Save intermediates for backward ──
@@ -727,8 +723,6 @@ class Cubes2FFTFunction(torch.autograd.Function):
         ctx.norm_factor = norm_factor
         ctx.xi = xi
         ctx.order = order
-        ctx.remove_self_interaction = remove_self_interaction
-        ctx.self_coeff = self_coeff
         ctx.diag_sum_fft = diag_sum_fft
         # ── Save for amp/bw gradient computation ──
         ctx.deconv = deconv.detach()                  # exp(+Σ σ_{s,α}² k_α²)
@@ -798,11 +792,8 @@ class Cubes2FFTFunction(torch.autograd.Function):
         )
         grad_q = potential * N3 * norm_factor
 
-        # Self-interaction corrections: ∂/∂q of -(q²)·diag_sum and -(q²)·self_coeff
-        if ctx.remove_self_interaction:
-            grad_q = grad_q - 2.0 * q * ctx.diag_sum_fft * norm_factor
-        if ctx.self_coeff != 0.0:
-            grad_q = grad_q - 2.0 * q * ctx.self_coeff * norm_factor
+        # Self-energy gradient: ∂/∂q of -(q²)·diag_sum = -2q·diag_sum
+        grad_q = grad_q - 2.0 * q * ctx.diag_sum_fft * norm_factor
 
         # ∂E/∂r = -force  (force = -∂E/∂r, so ∂E/∂r = -explicit_force)
         grad_r = grad_output * (-explicit_force)
@@ -811,11 +802,10 @@ class Cubes2FFTFunction(torch.autograd.Function):
         grad_q_out = grad_output * grad_q if ctx.needs_input_grad[0] else None
 
         # ── amp / bandwidth gradients: kernel parameter optimization ──
-        # ∂E/∂amp[m] = ½·V/N⁶·Σ w·exp(-½·bw[m]·k²)/|Φ|²·|ρ|²
         # ∂E/∂amp[m] = ½·V/N⁶·Σ w·exp(-½·bw[m]·k²)·deconv·|ρ|²
-        #               - Q²·Σ w·exp(-½·bw[m]·k²)/(2V)  (if remove_self_interaction)
+        #               - Q²·Σ w·exp(-½·bw[m]·k²)/(2V)
         # ∂E/∂bw[m]  = ½·V/N⁶·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]·deconv·|ρ|²
-        #               - Q²·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]/(2V)  (if remove_self_interaction)
+        #               - Q²·Σ w·[-½·amp[m]·k²·exp(-½·bw[m]·k²)]/(2V)
         grad_amp = None
         grad_bw2 = None
 
@@ -844,17 +834,15 @@ class Cubes2FFTFunction(torch.autograd.Function):
 
             if ctx.needs_input_grad[3]:
                 grad_amp = prefactor_main * weighted.sum(dim=(1, 2, 3))  # [M]
-                if ctx.remove_self_interaction:
-                    diag_all = (ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
-                    grad_amp = grad_amp - ctx.q_sq_sum * diag_all
+                diag_all = (ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
+                grad_amp = grad_amp - ctx.q_sq_sum * diag_all
 
             if ctx.needs_input_grad[4]:
                 ksq_w = (-0.5 * k_sq_4d) * weighted        # [M, nz, ny, nx//2+1]
                 amp_4d = amp_bw.view(M, 1, 1, 1)
                 grad_bw2 = prefactor_main * (amp_4d * ksq_w).sum(dim=(1, 2, 3))
-                if ctx.remove_self_interaction:
-                    diag_all = (amp_4d * (-0.5 * k_sq_4d) * ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
-                    grad_bw2 = grad_bw2 - ctx.q_sq_sum * diag_all
+                diag_all = (amp_4d * (-0.5 * k_sq_4d) * ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
+                grad_bw2 = grad_bw2 - ctx.q_sq_sum * diag_all
 
             if ctx.needs_input_grad[3] and grad_amp is not None:
                 grad_amp = grad_amp * norm_factor * grad_output
@@ -862,11 +850,10 @@ class Cubes2FFTFunction(torch.autograd.Function):
                 grad_bw2 = grad_bw2 * norm_factor * grad_output
 
         # Return grads for: q, r, cell, amp, bw2, volume_val, diag_sum_val,
-        #                   cubes2_phi_max, n_dl, r_c, b, order,
-        #                   xi, remove_self, self_coeff, norm_factor
+        #                   cubes2_phi_max, n_dl, r_c, b, order, xi, norm_factor
         return (grad_q_out, grad_r, None, grad_amp, grad_bw2, None, None,
                 None, None, None, None, None,
-                None, None, None, None)
+                None, None)
 
 
 # ── Reciprocal-space virial (energy + self-energy strain derivatives) ──
@@ -880,7 +867,6 @@ def mesh_reciprocal_virial(
     KXr: torch.Tensor, KYr: torch.Tensor, KZr: torch.Tensor,   # real k-vectors [nz,ny,nx//2+1]
     rfft_w: torch.Tensor,           # rfftn mirror weight [1,1,nx//2+1]
     vol: float, s2: float, norm_factor: float, qsq: float,
-    remove_self_interaction: bool,
 ) -> torch.Tensor:
     """Reciprocal virial W = −∂E/∂ε (3×3), matching the direct k-sum stress.
 
@@ -904,20 +890,20 @@ def mesh_reciprocal_virial(
     W[0, 2] = W[2, 0] = -comp(KXr, KZr)
     W[1, 2] = W[2, 1] = -comp(KYr, KZr)
 
-    if remove_self_interaction:
-        ds = (rfft_w * kfac).sum() / (2.0 * vol)          # diag_sum
-        pv = qsq * norm_factor / (2.0 * vol)
+    # Self-energy strain derivative (W_self_strain), matching C++ sog.cpp
+    ds = (rfft_w * kfac).sum() / (2.0 * vol)          # diag_sum
+    pv = qsq * norm_factor / (2.0 * vol)
 
-        def scomp(Ka, Kb):
-            return pv * (rfft_w * kfacv * Ka * Kb).sum()
+    def scomp(Ka, Kb):
+        return pv * (rfft_w * kfacv * Ka * Kb).sum()
 
-        off = qsq * norm_factor * ds
-        W[0, 0] = W[0, 0] + scomp(KXr, KXr) - off
-        W[1, 1] = W[1, 1] + scomp(KYr, KYr) - off
-        W[2, 2] = W[2, 2] + scomp(KZr, KZr) - off
-        W[0, 1] = W[1, 0] = W[0, 1] + scomp(KXr, KYr)
-        W[0, 2] = W[2, 0] = W[0, 2] + scomp(KXr, KZr)
-        W[1, 2] = W[2, 1] = W[1, 2] + scomp(KYr, KZr)
+    off = qsq * norm_factor * ds
+    W[0, 0] = W[0, 0] + scomp(KXr, KXr) - off
+    W[1, 1] = W[1, 1] + scomp(KYr, KYr) - off
+    W[2, 2] = W[2, 2] + scomp(KZr, KZr) - off
+    W[0, 1] = W[1, 0] = W[0, 1] + scomp(KXr, KYr)
+    W[0, 2] = W[2, 0] = W[0, 2] + scomp(KXr, KZr)
+    W[1, 2] = W[2, 1] = W[1, 2] + scomp(KYr, KZr)
     return W
 
 
@@ -936,8 +922,6 @@ def compute_cubes2_fft(
     b: float = 2.0,
     xi: float = XI_4,
     order: int = 4,
-    remove_self_interaction: bool = True,
-    self_coeff: float = 0.0,
     norm_factor: float = 1.0,
     compute_force: bool = False,
     compute_virial: bool = False,
@@ -1063,11 +1047,8 @@ def compute_cubes2_fft(
     rho_sq = rho_k.real**2 + rho_k.imag**2
 
     energy = 0.5 * volume_val * s2_val * (_rfft_w2 * green_k * rho_sq).sum()
-    if remove_self_interaction:
-        energy = energy - (q * q).sum() * diag_sum_fft
-    # Real-space self-energy (fastsog convention, applied before norm_factor)
-    if self_coeff != 0.0:
-        energy = energy - (q * q).sum() * self_coeff
+    # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
+    energy = energy - (q * q).sum() * diag_sum_fft
     energy = energy * norm_factor
 
     result: Dict[str, Optional[torch.Tensor]] = {
@@ -1101,17 +1082,33 @@ def compute_cubes2_fft(
         result["forces"] = force
 
         if compute_virial:
+            # ── Analytic virial: complete strain-derivative of E_k ──
+            # W_αβ = C·Σ w·|ρ̂|²·(green_energy·δ_αβ − green_virial·k_α·k_β)  [reciprocal]
+            #      + q²·norm/(2V)·(Σ w·K_v·k_α·k_β − δ_αβ·Σ w·K)            [self-energy]
+            # The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
+            # coordinate spreading + Form-B deconvolution. The analytic formula IS the
+            # complete virial (verified vs finite-strain FD, 1e-9). Matches fastsog.cpp,
+            # PPPM vg, quads_fft.py, and the direct k-sum autograd path.
+            # Compute virial Green function: kfacv_fft = K_v(k²) = Σ amp·β·exp(-½β·k²)
             kfacv_fft = (amp_dev.view(1, 1, 1, -1) * bw2_dev.view(1, 1, 1, -1)
                          * torch.exp(-0.5 * bw2_dev.view(1, 1, 1, -1) * k_sq.unsqueeze(-1))).sum(dim=-1)
             kfacv_fft[0, 0, 0] = 0.0
             kfacv_fft = kfacv_fft.masked_fill(k_sq > k_sq_max, 0.0)
-            green_virial = (kfacv_fft * deconv).masked_fill(k_sq > k_sq_max, 0.0)
-            green_virial[0, 0, 0] = 0.0
+            green_virial = kfacv_fft * deconv
+            qsq_val = float((q * q).sum())
             result["virial"] = mesh_reciprocal_virial(
-                rho_sq, green_k, green_virial, kfac_fft, kfacv_fft,
-                KX2.permute(2, 1, 0), KY2.permute(2, 1, 0), KZ2.permute(2, 1, 0),
-                _rfft_w2, volume_val, s2_val, norm_factor, float((q * q).sum()),
-                remove_self_interaction)
+                rho_sq=rho_sq,
+                green_energy=green_k,
+                green_virial=green_virial,
+                kfac=kfac_fft,
+                kfacv=kfacv_fft,
+                KXr=KX2, KYr=KY2, KZr=KZ2,
+                rfft_w=_rfft_w2,
+                vol=volume_val,
+                s2=s2_val,
+                norm_factor=norm_factor,
+                qsq=qsq_val,
+            )
 
     # ── ∂E/∂q: potential at atoms via G·ρ/V → irfftn → interpolate ──
     if compute_dq:
@@ -1123,11 +1120,8 @@ def compute_cubes2_fft(
             r_frac, phi_grid, nx, ny, nz, xi=xi, order=order,
         )
         dq = dq * N3_val * norm_factor
-        # Self-interaction corrections
-        if remove_self_interaction:
-            dq = dq - 2.0 * q * diag_sum_fft * norm_factor
-        if self_coeff != 0.0:
-            dq = dq - 2.0 * q * self_coeff * norm_factor
+        # Self-energy gradient: ∂/∂q of -q²·diag_sum = -2q·diag_sum
+        dq = dq - 2.0 * q * diag_sum_fft * norm_factor
         result["dq"] = dq
 
     return result

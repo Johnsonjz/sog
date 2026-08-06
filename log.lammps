@@ -1,0 +1,89 @@
+LAMMPS (22 Jul 2025 - Update 4)
+units           metal
+boundary        p p p
+atom_style      charge
+plugin load     /root/code/dp_build/lmp/plugin/libdeepmd_lmp.so
+Loading plugin: deepmd pair style  by Han Wang
+Loading plugin: deepspin pair style  by Duo Zhang
+Loading plugin: compute deeptensor/atom  by Han Wang
+Loading plugin: fix dplr  by Han Wang
+Loading plugin: kspace pppm/dplr  by Han Wang
+Loading plugin: kspace les  by DeepMD contributors
+Loading plugin: kspace sog  by DeepMD contributors
+Loading plugin: fix sog/response  by DeepMD contributors
+neighbor        2.0 bin
+neigh_modify    every 10 delay 0 check no
+
+read_data       /root/code/deepmd-example/water-scan0/lmp/replicate/data/water_charge_192_ortho.lmp
+Reading data file ...
+  orthogonal box = (0 0 0) to (12.4447 12.4447 12.4447)
+  1 by 1 by 1 MPI processor grid
+  reading atoms ...
+  192 atoms
+  read_data CPU = 0.008 seconds
+mass            1 15.999
+mass            2 1.008
+
+pair_style      lj/cut 5.0
+pair_coeff      * * 0.0 0.0
+
+kspace_style    sog 1e-6 1.6297670882677646 2.180230445405648 12   amp 29.2281782 75.6040668 202.173692 540.315084 1452.20413 3857.25858 10245.4217 27213.2823 72282.3085 191991.986 509957.740 1354519.54   bandwidth 3.25834950 13.8809516 36.6628639 96.4459275 236.597073 628.434810 1669.21132 4433.66022 11776.4256 31278.8441 83083.6690 220681.920   remove_self_interaction yes spline cubes2_6 phi_max 0.16
+
+compute         kv all pressure NULL virial
+thermo_style    custom step elong c_kv[1] c_kv[2] c_kv[3] c_kv[4] c_kv[5] c_kv[6]
+thermo          1
+run             0
+WARNING: No fixes with time integration, atoms won't move
+For more information see https://docs.lammps.org/err0028 (src/verlet.cpp:60)
+SOG external amp: 29.2281782000 75.6040668000 202.1736920000 540.3150840000 1452.2041300000 3857.2585800000 10245.4217000000 27213.2823000000 72282.3085000000 191991.9860000000 509957.7400000000 1354519.5400000000
+SOG external bandwidth: 3.2583495000 13.8809516000 36.6628639000 96.4459275000 236.5970730000 628.4348100000 1669.2113200000 4433.6602200000 11776.4256000000 31278.8441000000 83083.6690000000 220681.9200000000
+SOG amp_sum=2172367.062231 self_coeff=0.000000
+WARNING: Using kspace solver on system with no charge (src/kspace.cpp:322)
+SOG initialization ...
+  b = 1.62977, sigma = 2.18023, M = 12
+  n_dl = 2.60606, accuracy = 1e-06
+  w0 = 1.0195218, rcut = 5
+  SOG-bandwidth grid: phi_max=0.1600 delta=0.416969 -> 30x30x30
+Generated 0 of 1 mixed pair_coeff terms from geometric mixing rule
+Neighbor list info ...
+  update: every = 10 steps, delay = 0 steps, check = no
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 7
+  ghost atom cutoff = 7
+  binsize = 3.5, bins = 4 4 4
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair lj/cut, perpetual
+      attributes: half, newton on
+      pair build: half/bin/atomonly/newton
+      stencil: half/bin/3d
+      bin: standard
+Per MPI rank memory allocation (min/avg/max) = 5.234 | 5.234 | 5.234 Mbytes
+   Step         E_long        c_kv[1]        c_kv[2]        c_kv[3]        c_kv[4]        c_kv[5]        c_kv[6]    
+         0   0              0              0              0              0              0              0            
+Loop time of 3.183e-06 on 1 procs for 0 steps with 192 atoms
+
+219.9% CPU use with 1 MPI tasks x no OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 0          | 0          | 0          |   0.0 |  0.00
+Kspace  | 0          | 0          | 0          |   0.0 |  0.00
+Neigh   | 0          | 0          | 0          |   0.0 |  0.00
+Comm    | 0          | 0          | 0          |   0.0 |  0.00
+Output  | 0          | 0          | 0          |   0.0 |  0.00
+Modify  | 0          | 0          | 0          |   0.0 |  0.00
+Other   |            | 3.183e-06  |            |       |100.00
+
+Nlocal:            192 ave         192 max         192 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:           1688 ave        1688 max        1688 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:          13619 ave       13619 max       13619 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 13619
+Ave neighs/atom = 70.932292
+Neighbor list builds = 0
+Dangerous builds not checked
+Total wall time: 0:00:00

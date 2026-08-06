@@ -219,8 +219,6 @@ def compute_quads_fft(
     r_c: float,
     b: float,
     order: int = 4,
-    remove_self_interaction: bool = True,
-    self_coeff: float = 0.0,
     norm_factor: float = 1.0,
     compute_force: bool = False,
     compute_virial: bool = False,
@@ -289,10 +287,8 @@ def compute_quads_fft(
     rho_sq = rho_k.real ** 2 + rho_k.imag ** 2
 
     energy = 0.5 * vol_val * s2 * (_rfft_w * green_k * rho_sq).sum()
-    if remove_self_interaction:
-        energy = energy - (q * q).sum() * diag_sum_fft
-    if self_coeff != 0.0:
-        energy = energy - (q * q).sum() * self_coeff
+    # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
+    energy = energy - (q * q).sum() * diag_sum_fft
     energy = energy * norm_factor
 
     result: Dict[str, Optional[torch.Tensor]] = {"energy": energy, "forces": None, "virial": None}
@@ -321,6 +317,6 @@ def compute_quads_fft(
             result["virial"] = mesh_reciprocal_virial(
                 rho_sq, green_k, green_virial, kfac_fft, kfacv_fft,
                 KX.permute(2, 1, 0), KY.permute(2, 1, 0), KZ.permute(2, 1, 0),
-                _rfft_w, vol_val, s2, norm_factor, float((q * q).sum()), remove_self_interaction)
+                _rfft_w, vol_val, s2, norm_factor, float((q * q).sum()))
 
     return result
