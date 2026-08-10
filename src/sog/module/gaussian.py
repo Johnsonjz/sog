@@ -701,7 +701,8 @@ class Gaussian(nn.Module):
                 )
 
                 # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
-                pot_now = pot_now - torch.sum(q_now * q_now) * state["diag_sum"]
+                if self.remove_self_interaction:
+                    pot_now = pot_now - torch.sum(q_now * q_now) * state["diag_sum"]
 
                 pot_now = pot_now * self.norm_factor
                 force_now = force_now * self.norm_factor
@@ -818,13 +819,9 @@ class Gaussian(nn.Module):
         )
 
         if self.use_nufft and HAS_PYTORCH_FINUFFT:
-            pot = self._compute_periodic_nufft(
-                state["r_in"],
-                state["q"],
-                state["kfac"],
-                state["output_shape"],
-                state["volume"],
-            )
+            pot = self._compute_periodic_nufft_bundle(
+                state, need_force=False, need_virial=False,
+            )[0]
         else:
             pot = self._compute_periodic_direct(
                 state["r_raw"],
@@ -836,7 +833,8 @@ class Gaussian(nn.Module):
             )
 
         # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
-        pot = pot - torch.sum(state["q"] * state["q"]) * state["diag_sum"]
+        if self.remove_self_interaction:
+            pot = pot - torch.sum(state["q"] * state["q"]) * state["diag_sum"]
 
         return pot * self.norm_factor
 
@@ -1017,35 +1015,6 @@ class Gaussian(nn.Module):
             "diag_sum": diag_sum,
         }
 
-    def _compute_periodic_nufft(
-        self,
-        r_in: torch.Tensor,
-        q: torch.Tensor,
-        kfac: torch.Tensor,
-        output_shape: Tuple[int, int, int],
-        volume: torch.Tensor,
-    ) -> torch.Tensor:
-        q_t = q.transpose(0, 1).contiguous()
-        complex_dtype = torch.complex128 if q.dtype == torch.float64 else torch.complex64
-        charge = torch.complex(q_t, torch.zeros_like(q_t)).to(dtype=complex_dtype).contiguous()
-
-        nufft_points = r_in.transpose(0, 1).contiguous()
-        recon = pytorch_finufft.functional.finufft_type1(
-            nufft_points,
-            charge,
-            output_shape=output_shape,
-            eps=self.nufft_eps,
-            isign=-1,
-        )
-
-        if recon.dim() == 3:
-            recon = recon.unsqueeze(0)
-
-        recon = torch.fft.fftshift(recon, dim=(1, 2, 3))
-        rho_sq = recon.real.square() + recon.imag.square()
-
-        return (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
-
     def _compute_periodic_nufft_bundle(
         self,
         state: Dict[str, torch.Tensor | Tuple[int, int, int]],
@@ -1188,7 +1157,8 @@ class Gaussian(nn.Module):
         q_sq_sum = (q_f * q_f).sum(dim=(1, 2))                        # [nf]
 
         pot = e_recip
-        pot = pot - q_sq_sum * diag_sum
+        if self.remove_self_interaction:
+            pot = pot - q_sq_sum * diag_sum
         pot = pot * self.norm_factor
 
         # k=0: identically zero for charge-neutral systems (Q=0), matching Ewald convention.
