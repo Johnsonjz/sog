@@ -237,12 +237,19 @@ class Gaussian(nn.Module):
 
         if use_external:
             # Keep references to external tensors so autograd can flow back to
-            # the caller-owned parameters (e.g. upstream fitting nets).
+            # the caller-owned parameters (e.g. upstream fitting nets).  ``bw2``
+            # has already been normalized to the *squared* bandwidth above.
             self.amp = amp_tensor
             self.bandwidth = bw2
+            self._bandwidth_is_squared = True
         else:
+            # Store the *pre-square* bandwidth (σ·b^m) as the trainable parameter
+            # and square it on use.  This guarantees bw² ≥ 0, so the Gaussian
+            # kernel exp(-r²/(2 bw²)) can never degenerate into an exponential
+            # exp(+r²/(2|bw²|)) if the parameter drifts negative.
             self.amp = nn.Parameter(amp_tensor, requires_grad=trainable)
-            self.bandwidth = nn.Parameter(bw2, requires_grad=trainable)
+            self.bandwidth = nn.Parameter(bw2.sqrt(), requires_grad=trainable)
+            self._bandwidth_is_squared = False
 
         self.remove_self_interaction = bool(remove_self_interaction)
         self.charge_neutral_lambda = charge_neutral_lambda
@@ -271,6 +278,18 @@ class Gaussian(nn.Module):
             Tuple[str, str, int, tuple],
             Dict[str, torch.Tensor],
         ] = {}
+
+    def _bw2(self) -> torch.Tensor:
+        """Return the squared bandwidth bw², guaranteed non-negative.
+
+        Owned mode stores the *pre-square* bandwidth (σ·b^m) as the trainable
+        parameter and squares it here; external mode already binds the squared
+        tensor.  All kernel computations consume ``_bw2()`` so a negative
+        parameter can never turn a Gaussian into an exponential.
+        """
+        if self._bandwidth_is_squared:
+            return self.bandwidth
+        return self.bandwidth.square()
 
     @staticmethod
     def _device_key(device: torch.device) -> str:
@@ -594,7 +613,7 @@ class Gaussian(nn.Module):
                             r=state["r_raw"],
                             cell=box_now,
                             amp=self.amp,
-                            bw2=self.bandwidth,
+                            bw2=self._bw2(),
                             volume=state["volume"],
                             diag_sum=state["diag_sum"],
                             cubes2_phi_max=self.cubes2_phi_max,
@@ -624,7 +643,7 @@ class Gaussian(nn.Module):
                             state["r_raw"],
                             box_now,
                             self.amp,
-                            self.bandwidth,
+                            self._bw2(),
                             volume_val,
                             diag_sum_val,
                             self.cubes2_phi_max,
@@ -666,7 +685,7 @@ class Gaussian(nn.Module):
                         r=state["r_raw"],
                         cell=box_now,
                         amp=self.amp,
-                        bw2=self.bandwidth,
+                        bw2=self._bw2(),
                         volume=state["volume"],
                         diag_sum=state["diag_sum"],
                         cubes2_phi_max=self.cubes2_phi_max,
@@ -773,7 +792,7 @@ class Gaussian(nn.Module):
         r_sq = torch.sum(r_ij * r_ij, dim=-1, keepdim=True)
 
         amp = self.amp.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
-        bw2 = self.bandwidth.to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
+        bw2 = self._bw2().to(dtype=r_raw.dtype, device=r_raw.device).view(1, 1, -1)
         kernel = amp * torch.exp(-0.5 * r_sq / bw2)
         kernel = kernel.sum(dim=-1)
 
@@ -794,7 +813,7 @@ class Gaussian(nn.Module):
         Gaussian. Replaces a per-frame ``bandwidth.min().item()`` sync with one."""
         if self.n_dl is not None:
             return float(self.n_dl)
-        bw_min = self.bandwidth.to(dtype=dtype, device=device).min().item()
+        bw_min = self._bw2().to(dtype=dtype, device=device).min().item()
         _eps = 1e-5
         _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
         return 2.0 * math.pi / max(_kmax, 1e-30)
@@ -919,7 +938,7 @@ class Gaussian(nn.Module):
         else:
             _n_dl = self.n_dl
             if _n_dl is None:
-                bw_min = self.bandwidth.to(dtype=real_dtype, device=runtime_device).min().item()
+                bw_min = self._bw2().to(dtype=real_dtype, device=runtime_device).min().item()
                 # ε = 1e-5: n_dl = 2π / sqrt(2·ln(1/ε) / bw_min)
                 _eps = 1e-5
                 _kmax = math.sqrt(2.0 * math.log(1.0 / _eps) / max(bw_min, 1e-30))
@@ -977,7 +996,7 @@ class Gaussian(nn.Module):
         k_mode_mask = (~zero_mask) & (k_sq <= k_sq_max)
 
         amp = self.amp.to(dtype=real_dtype, device=runtime_device).view(1, -1)
-        bw2 = self.bandwidth.to(dtype=real_dtype, device=runtime_device).view(1, -1)
+        bw2 = self._bw2().to(dtype=real_dtype, device=runtime_device).view(1, -1)
 
         if prefilter:
             # Direct path: compute kfac only on valid k-points (k≠0, k≤k_max).
@@ -1139,7 +1158,7 @@ class Gaussian(nn.Module):
         mode_mask = (~zero_flat).unsqueeze(0) & (k_sq <= k_sq_max)      # [nf,G]
 
         amp = self.amp.to(dtype=dtype, device=device).view(1, 1, -1)    # [1,1,M]
-        bw2 = self.bandwidth.to(dtype=dtype, device=device).view(1, 1, -1)
+        bw2 = self._bw2().to(dtype=dtype, device=device).view(1, 1, -1)
         kfac = (amp * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))).sum(dim=-1)  # [nf,G]
         kfac = kfac.masked_fill(~mode_mask, 0.0)
 
