@@ -251,6 +251,12 @@ class Gaussian(nn.Module):
             self.bandwidth = nn.Parameter(bw2.sqrt(), requires_grad=trainable)
             self._bandwidth_is_squared = False
 
+        # Checkpoint format marker: v2 = bandwidth stored PRE-SQUARE (σ·b^m).
+        # Buffers travel with state_dict, so cross-version loads can detect the
+        # legacy (squared) format and convert it instead of silently misreading
+        # it (see ``_load_from_state_dict``).
+        self.register_buffer("_bw_format_version", torch.tensor(2))
+
         self.remove_self_interaction = bool(remove_self_interaction)
         self.charge_neutral_lambda = charge_neutral_lambda
         self.use_nufft = bool(use_nufft if nufft is None else nufft)
@@ -278,6 +284,45 @@ class Gaussian(nn.Module):
             Tuple[str, str, int, tuple],
             Dict[str, torch.Tensor],
         ] = {}
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward compatibility: legacy checkpoints (no ``_bw_format_version``
+        # marker) stored ``bandwidth`` in the *squared* form bw².  The current
+        # module stores the pre-square σ·b^m parameter and squares it on use
+        # (``_bw2``), so loading a legacy value silently would produce bw⁴.
+        # Detect the missing marker and recover the pre-square parameter via
+        # sqrt (legacy bw² ≥ 0, so the root is well-defined).  New-format
+        # checkpoints load normally; loading a NEW checkpoint into OLD sog code
+        # fails loudly on the unexpected marker key under strict=True instead of
+        # silently misreading bw².
+        bw_key = prefix + "bandwidth"
+        if bw_key in state_dict and prefix + "_bw_format_version" not in state_dict:
+            # Up-convert the legacy checkpoint in place: sqrt-recover the
+            # pre-square parameter and stamp it as v2 so the strict load below
+            # does not flag the marker as missing.
+            state_dict = state_dict.copy()
+            bw = state_dict[bw_key]
+            if bw is not None:
+                state_dict[bw_key] = bw.clamp(min=0).sqrt()
+            state_dict[prefix + "_bw_format_version"] = torch.tensor(2)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _bw2(self) -> torch.Tensor:
         """Return the squared bandwidth bw², guaranteed non-negative.
