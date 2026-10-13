@@ -14,14 +14,13 @@ calibrate_phi_max_anchors.py, which bisects a PANEL of random systems x kernels 
 Delta/sigma_min across kernels is what justifies the closed form). The live sog.cpp / FALLBACK_LAW
 constants come from that panel: order-6 {C=1.681e-2, p=6.533}, order-4 {C=4.465e-2, p=3.956}."""
 import sys, math
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 import numpy as np, torch
 torch.set_default_dtype(torch.float64)
 from sog.module.gaussian import Gaussian
-from verify_fft_vs_direct import E2_PER_ANGSTROM_TO_EV as NORM, B, RCUT
-from verify_cons_phi import AMP_CONS, BW_CONS
-from fit_phi_max_law import load_water192
-from phi_max_rule import sigma_min_of, validity_phi, phi_max_from_law, XI0
+from sog.tools.verify_fft_vs_direct import E2_PER_ANGSTROM_TO_EV as NORM, B, RCUT
+from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS
+from sog.tools.fit_phi_max_law import load_water192
+from sog.tools.phi_max_rule import sigma_min_of, validity_phi, phi_max_from_law, XI0
 
 COORDS, Q, BOX, _ = load_water192()
 CELL = torch.tensor(BOX, dtype=torch.float64).unsqueeze(0)

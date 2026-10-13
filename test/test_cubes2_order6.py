@@ -89,13 +89,3 @@ def test_order6_moment_conditions_pass():
     """
     assert _max_moment_theta_std(6, XI_6, max_deg=5) < 1e-9
 
-
-if __name__ == "__main__":
-    test_order6_nodes_are_available()
-    test_order6_weights_are_finite_and_structured()
-    test_order6_partition_of_unity()
-    test_order4_moment_conditions_pass()
-    test_order6_moment_conditions_pass()
-    print("Order-6 smoke + moment checks passed: order-4 through degree 3, "
-          "order-6 through degree 5.")
-

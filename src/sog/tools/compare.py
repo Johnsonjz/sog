@@ -9,9 +9,8 @@ core_ext = Gaussian(
     n_dl=2.0,
     amp=amp_internal.clone().requires_grad_(True),
     bandwidth=bw2.clone().requires_grad_(True),
-    amp_is_internal=True,
-    bandwidth_is_squared=True,
-    use_external_kernel_tensors=True,
+    kernel_param_mode="internal",
+    kernel_tensor_mode="external",
     use_nufft=False,
     trainable=False,
 )

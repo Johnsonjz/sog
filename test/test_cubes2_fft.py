@@ -26,6 +26,7 @@ def make_water_system(n_molecules=64, device="cpu"):
 
 def test_influence_function():
     """Test that precomputed influence function is sane."""
+    from sog.module.cubes2_spline import XI_4
     from sog.module.influence_analytic import precompute_influence_analytic
 
     print("─── Test: Influence Function ───")
@@ -33,7 +34,7 @@ def test_influence_function():
     lx, ly, lz = 40.0, 40.0, 40.0
 
     t0 = time.perf_counter()
-    inf_sq = precompute_influence_analytic(nx, ny, nz, lx, ly, lz)
+    inf_sq = precompute_influence_analytic(nx, ny, nz, lx, ly, lz, XI_4)
     t1 = time.perf_counter()
 
     print(f"  Grid: {nx}×{ny}×{nz}, time: {t1-t0:.2f}s")
@@ -76,7 +77,9 @@ def test_energy_consistency():
 
     # Direct sum energy (use_cubes2_fft=False path in Gaussian)
     g_dir = Gaussian(n_dl=test_n_dl, use_cubes2_fft=False,
-                     amp=g_ref.amp.data.clone(), bandwidth=g_ref.bandwidth.data.clone(),
+                     amp=g_ref.amp.data.clone(),
+                     # _bw2(), not .bandwidth: pre-square since the v2 format
+                     bandwidth=g_ref._bw2().data.clone(),
                      remove_self_interaction=True, kernel_param_mode="internal",
                      b=float(g_ref.b), rcut=6.0, nlayers=1)
     e_direct = g_dir(q.unsqueeze(1), r, cell.unsqueeze(0))
@@ -84,7 +87,9 @@ def test_energy_consistency():
 
     # CubeS₂+FFT energy (use_cubes2_fft=True path in Gaussian)
     g_fft = Gaussian(n_dl=test_n_dl, use_cubes2_fft=True,
-                     amp=g_ref.amp.data.clone(), bandwidth=g_ref.bandwidth.data.clone(),
+                     amp=g_ref.amp.data.clone(),
+                     # _bw2(), not .bandwidth: pre-square since the v2 format
+                     bandwidth=g_ref._bw2().data.clone(),
                      remove_self_interaction=True, kernel_param_mode="internal",
                      b=float(g_ref.b), rcut=6.0, nlayers=1)
     e_fft = g_fft(q.unsqueeze(1), r, cell.unsqueeze(0))
@@ -126,11 +131,13 @@ def test_autograd():
         r=r,
         cell=cell,
         amp=g_ref.amp.to(dtype=dtype),
-        bw2=g_ref.bandwidth.to(dtype=dtype),
+        # _bw2(), not .bandwidth: owned-mode ``bandwidth`` is the PRE-SQUARE
+        # parameter (σ·b^m) since the v2 checkpoint format, and compute_cubes2_fft
+        # expects bw².  Passing .bandwidth here silently ran a different kernel.
+        bw2=g_ref._bw2().to(dtype=dtype),
         volume=state["volume"],
         diag_sum=state["diag_sum"],
         n_dl=1.0,
-        remove_self_interaction=True,
         norm_factor=g_ref.norm_factor,
         compute_force=True,
     )
@@ -138,10 +145,10 @@ def test_autograd():
     energy = result["energy"]
     forces = result["forces"]
 
+    assert forces is not None, "Forces should not be None"
     print(f"  Energy: {energy.item():.8f}")
     print(f"  Forces shape: {tuple(forces.shape)}")
     print(f"  Force norm: {forces.norm().item():.6f}")
-    assert forces is not None, "Forces should not be None"
     assert forces.shape == (r.shape[0], 3), f"Wrong force shape: {forces.shape}"
     print("  ✓ PASSED (autograd flows correctly)")
 
@@ -200,6 +207,16 @@ def test_speed():
         g_fft = Gaussian(n_dl=1.0, use_cubes2_fft=True, use_nufft=False,
                          remove_self_interaction=True)
 
+        # Correctness at the timings' configuration: same kernel, same box —
+        # the FFT value must match the direct one to mesh accuracy.
+        e_direct = g_direct(q, r, cell_batch).sum().item()
+        e_fft = g_fft(q, r, cell_batch).sum().item()
+        e_rel = abs(e_fft - e_direct) / max(abs(e_direct), 1e-30)
+        assert e_rel < 2e-2, (
+            f"{n_mol * 3} atoms: FFT-vs-direct energy rel {e_rel:.2e} "
+            f"(n_dl=1.0 is a coarse k-space; measured ≈1e-3 … 1e-2 here)"
+        )
+
         # Warmup
         for _ in range(n_warmup):
             g_direct(q, r, cell_batch)
@@ -219,14 +236,3 @@ def test_speed():
 
         n_atoms = n_mol * 3
         print(f"  {n_atoms} atoms: direct={t_direct*1000:.1f}ms, FFT={t_fft*1000:.1f}ms, speedup={t_direct/t_fft:.1f}x")
-
-
-if __name__ == "__main__":
-    test_influence_function()
-    test_energy_consistency()
-    test_autograd()
-    test_through_gaussian()
-    test_speed()
-    print("\n" + "=" * 60)
-    print("All tests passed!")
-    print("=" * 60)

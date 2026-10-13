@@ -47,14 +47,15 @@ def main() -> None:
         dtype=dtype,
     ).unsqueeze(0)
 
+    # The NUFFT branch supplies explicit forces but no analytic virial, so the
+    # virial's box-strain term comes from autograd and needs a cell leaf.
     out_sog = model(
         positions=r.clone(),
-        cell=cell,
+        cell=cell.clone().requires_grad_(True),
         latent_charges=q,
         compute_energy=True,
         compute_force=True,
         compute_virial=True,
-        use_explicit_derivatives=True,
     )
 
     if not out_sog["used_explicit_derivatives"]:

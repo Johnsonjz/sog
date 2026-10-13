@@ -8,16 +8,20 @@ Compares, per frame of the LAMMPS-generated trajectory (shared configs, identica
   - kspace FORCE : C++ atom->f (pure kspace) vs Python direct autograd force  (k=0-free)
 for order-4 (phi=0.0675) and order-6 (phi=0.10). Produces a matplotlib figure. CPU-only.
 """
-import sys, math, numpy as np, torch
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
+import os, sys, math, numpy as np, torch
 torch.set_default_dtype(torch.float64)
 from sog.module.gaussian import Gaussian
-from verify_cons_phi import AMP_CONS, BW_CONS
-from verify_fft_vs_direct import E2_PER_ANGSTROM_TO_EV as NORM, B, RCUT
+from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS
+from sog.tools.verify_fft_vs_direct import E2_PER_ANGSTROM_TO_EV as NORM, B, RCUT
 
 AMP = np.asarray(AMP_CONS); BW = np.asarray(BW_CONS)
 BOX = 12.44470; VOL = BOX ** 3
-BASE = "/root/code/deepmd-example/water-scan0/lmp/scale2x4x4"
+BASE = os.environ.get("SOG_SCALE_DIR")
+if BASE is None:
+    raise RuntimeError(
+        "validate_kspace_192 reads LAMMPS outputs from an external run directory. "
+        "Set SOG_SCALE_DIR to the directory containing traj_192_*.txt and "
+        "kspace192_*.log (e.g. <run>/scale2x4x4).")
 NVE_STEPS = 1000   # NVE trajectory length (0.5 fs step -> 0.5 ps); stronger conservation test
 
 

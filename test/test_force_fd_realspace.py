@@ -19,8 +19,10 @@ def test_force_matches_fd_in_realspace():
     q = torch.rand(6, dtype=torch.float64) - 0.5
     q = q - q.mean()
 
+    # The non-periodic real-space path has no analytic derivatives; forces come
+    # from autograd, so the positions must carry grad.
     out = model(
-        positions=r.clone(),
+        positions=r.clone().requires_grad_(True),
         cell=None,
         latent_charges=q,
         compute_energy=True,

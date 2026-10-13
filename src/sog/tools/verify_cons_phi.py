@@ -6,14 +6,12 @@ and quantify the real-box grid-point reduction. Also probe separable QuadS if av
 Reuses sog/verify_phi_max.py helpers. Run with dp_dev python.
 """
 import sys, math
-sys.path.insert(0, "/root/code/sog/src")
-sys.path.insert(0, "/root/code/sog")
 import numpy as np
 import torch
 torch.set_default_dtype(torch.float64)
 
-from verify_phi_max import (energy_fft, reference_direct, sigma_min, realized_delta)
-from verify_fft_vs_direct import make_test_system, RCUT, B
+from sog.tools.verify_phi_max import (energy_fft, reference_direct, sigma_min, realized_delta)
+from sog.tools.verify_fft_vs_direct import make_test_system, RCUT, B
 from sog.module.cubes2_fft import _resolve_grid
 
 # ── CONSERVATIVE kernel: verbatim amp/bandwidth from sog_k0_cons_kspace.in ──

@@ -22,18 +22,17 @@ Force-rel is canonical (matches the C++ auto-derive at sog.cpp:911-912 and is wh
 by); energy-rel is reported alongside for transparency. CPU-only. Run with the dp env python.
 """
 import sys, os, json, math
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 import numpy as np
 import torch
 torch.set_default_dtype(torch.float64)
 
 from sog.module.gaussian import Gaussian
 from sog.module.cubes2_fft import _resolve_grid
-from verify_fft_vs_direct import (make_test_system, geometric_amp_bw,
+from sog.tools.verify_fft_vs_direct import (make_test_system, geometric_amp_bw,
                                   E2_PER_ANGSTROM_TO_EV as NORM, B, RCUT, SIGMA, M)
-from verify_cons_phi import AMP_CONS, BW_CONS, BOXP
-from verify_phi_max import AMP_MD, BW_MD, realized_delta
-from phi_max_rule import sigma_min_of, validity_phi, phi_max_from_law, XI0, FALLBACK_LAW
+from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS, BOXP
+from sog.tools.verify_phi_max import AMP_MD, BW_MD, realized_delta
+from sog.tools.phi_max_rule import sigma_min_of, validity_phi, phi_max_from_law, XI0, FALLBACK_LAW
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -150,7 +149,7 @@ def headline():
     print("HEADLINE — is the true FFT-vs-direct rel at phi=0.10 (order-6 cons) really 1e-4?")
     print("=" * 78)
     try:
-        from fit_phi_max_law import load_water192
+        from sog.tools.fit_phi_max_law import load_water192
         cw, qw, bw_box, Lw = load_water192()
         boxes = [("water192", cw, qw, np.asarray(bw_box))]
     except Exception as ex:

@@ -5,10 +5,8 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 
+from .kernel import RCUT_TO_SIGMA, SogKernel
 from .module import Atomwise, BEC, Gaussian
-
-
-RCUT_TO_SIGMA = 1.9892536839080267
 
 
 class Sog(nn.Module):
@@ -29,8 +27,10 @@ class Sog(nn.Module):
         self,
         sog_arguments: Union[Dict[str, Any], str, None] = None,
         r_cut: Optional[float] = None,
+        kernel: Optional[SogKernel] = None,
     ):
         super().__init__()
+        self.kernel: Optional[SogKernel] = None
 
         if sog_arguments is None:
             sog_arguments = {}
@@ -60,12 +60,32 @@ class Sog(nn.Module):
             else _DummyAtomwise()
         )
 
+        # When a SogKernel is supplied it becomes the source of the kernel
+        # tensors and the solver binds them in external mode, so the parameters
+        # live in exactly one place and gradients reach them directly.
+        if kernel is not None:
+            self.kernel = kernel
+            amp_i, bw2 = kernel.resolve()
+            gaussian_kwargs: Dict[str, Any] = dict(
+                amp=amp_i,
+                bandwidth=bw2,
+                kernel_param_mode="internal",
+                kernel_tensor_mode="external",
+                trainable=False,
+            )
+        else:
+            gaussian_kwargs = dict(
+                amp=self.amp,
+                bandwidth=self.bandwidth,
+                kernel_param_mode=self.kernel_param_mode,
+                kernel_tensor_mode=self.kernel_tensor_mode,
+                trainable=self.trainable_kernel,
+            )
+
         self.gaussian = Gaussian(
             n_dl=self.n_dl,
             cubes2_phi_max=self.cubes2_phi_max,
             cubes2_order=self.cubes2_order,
-            amp=self.amp,
-            bandwidth=self.bandwidth,
             b=self.b,
             sigma=self.sigma,
             m=self.m,
@@ -76,13 +96,13 @@ class Sog(nn.Module):
             use_nufft=self.nufft,
             nufft_eps=self.nufft_eps,
             norm_factor=self.norm_factor,
-            trainable=self.trainable_kernel,
-            kernel_param_mode=self.kernel_param_mode,
-            kernel_tensor_mode=self.kernel_tensor_mode,
             use_cubes2_fft=self.use_cubes2_fft,
             use_quads_fft=self.use_quads_fft,
             quads_order=self.quads_order,
+            **gaussian_kwargs,
         )
+        if self.kernel is not None:
+            self.kernel.sync_into(self.gaussian)
 
         self.bec = BEC(
             remove_mean=self.remove_mean,
@@ -189,6 +209,19 @@ class Sog(nn.Module):
         self.remove_mean = bool(args.get("remove_mean", True))
         self.epsilon_factor = float(args.get("epsilon_factor", 1.0))
 
+    def as_kernel(self) -> SogKernel:
+        """A :class:`SogKernel` view of this model's kernel parameters.
+
+        When the model was built from a ``SogKernel`` the original object is
+        returned.  Otherwise a read-only view of ``self.gaussian``'s parameters is
+        produced — same tensor objects, no duplicated parameters.  Useful for
+        exporting to LAMMPS:
+        :meth:`~sog.kernel.SogKernel.to_lammps_dict`.
+        """
+        if self.kernel is not None:
+            return self.kernel
+        return SogKernel.adopt(self.gaussian)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -197,11 +230,19 @@ class Sog(nn.Module):
         latent_charges: Optional[torch.Tensor] = None,
         batch: Optional[torch.Tensor] = None,
         compute_energy: bool = True,
+        compute_force: bool = False,
+        compute_virial: bool = False,
         compute_bec: bool = False,
         bec_output_index: Optional[int] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.int64, device=positions.device)
+
+        # ``Gaussian`` holds externally bound kernel tensors as plain attributes,
+        # which ``.to()``/``.cuda()`` on the kernel does not move.  Refresh the
+        # binding when the kernel's tensors changed (one int compare when not).
+        if self.kernel is not None:
+            self.kernel.sync_into(self.gaussian)
 
         if latent_charges is not None:
             if latent_charges.dim() == 1:
@@ -236,13 +277,49 @@ class Sog(nn.Module):
             frame_mean = frame_sum / frame_count.clamp(min=1).unsqueeze(-1)
             latent_charges = latent_charges - frame_mean[batch]
 
-        if compute_energy:
-            e_lr = self.gaussian(
+        forces = None
+        virial = None
+        used_explicit = None
+
+        if compute_energy or compute_force or compute_virial:
+            bundle = self.gaussian.compute_bundle(
                 q=latent_charges,
                 r=positions,
                 cell=cell,
                 batch=batch,
+                compute_force=compute_force,
+                compute_virial=compute_virial,
             )
+            energy = bundle["energy"]
+            e_lr = energy if compute_energy else None
+            used_explicit = bundle["used_explicit_derivatives"]
+            autograd_safe = bool(bundle.get("autograd_safe", False))
+            forces = bundle["forces"]
+            virial = bundle["virial"]
+            need_autograd = (compute_force and forces is None) or (
+                compute_virial and virial is None
+            )
+            if need_autograd:
+                if not autograd_safe:
+                    raise RuntimeError(
+                        "The solver took an explicit-derivative branch in some "
+                        "frames and an autograd branch in others, so it returns "
+                        "no forces for this mix.  Request them only on a uniform "
+                        "configuration (use_cubes2_fft / use_quads_fft / use_nufft "
+                        "for every frame, or for none)."
+                    )
+                ag_force, ag_virial = self._autograd_efv(
+                    energy,
+                    positions,
+                    cell,
+                    batch,
+                    forces=forces,
+                    need_virial=(compute_virial and virial is None),
+                )
+                if compute_force and forces is None:
+                    forces = ag_force
+                if compute_virial and virial is None:
+                    virial = ag_virial
         else:
             e_lr = None
 
@@ -260,7 +337,98 @@ class Sog(nn.Module):
             "E_lr": e_lr,
             "latent_charges": latent_charges,
             "BEC": bec,
+            # Additive: present (and None) unless compute_force/compute_virial asked
+            # for them, so existing callers that only read "E_lr" are unaffected.
+            "forces": forces,
+            "virial": virial,
+            "used_explicit_derivatives": used_explicit,
         }
+
+    def _autograd_efv(
+        self,
+        energy: torch.Tensor,
+        positions: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        batch: torch.Tensor,
+        forces: Optional[torch.Tensor],
+        need_virial: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Forces and virial by autograd, for solver paths with no analytic derivatives.
+
+        Used only when ``compute_bundle`` produced no explicit derivatives while
+        reporting ``autograd_safe`` — i.e. the energy came entirely from
+        differentiable operations and differentiating it is the intended route.
+
+        The virial is **not** simply ``-dE/dh``.  SOG's convention (and LAMMPS's)
+        is the affine one: a homogeneous strain of the whole system, which holds
+        the *fractional* coordinates fixed.  With ``h' = h(I + ε)`` that gives
+
+            W = -dE/dε = Σ_{i∈f} F_i ⊗ r_i  -  (∂E/∂h)ᵀ h        (per frame f)
+
+        The first term is the familiar per-atom position virial.  Dropping it
+        still reproduces the diagonal of a cubic cell but is wrong off-diagonal,
+        because ``∂E/∂h`` alone is the derivative at *fixed Cartesian* positions.
+        Both terms are obtained in a single ``autograd.grad`` pass.
+        """
+        # Only ask autograd for what is genuinely missing.  When the solver
+        # already produced forces (e.g. the NUFFT branch) they are used for the
+        # position-virial term, so `positions` need not be a grad leaf at all --
+        # only `cell` does, for the box-strain term.
+        leaves = []
+        want_force = forces is None
+        if want_force:
+            if not positions.requires_grad:
+                raise ValueError(
+                    "This solver path computes no analytic forces, so they must "
+                    "come from autograd — but `positions` does not require grad.  "
+                    "Set `positions.requires_grad_(True)` before the call and keep "
+                    "the graph (do not wrap the call in torch.no_grad)."
+                )
+            leaves.append(positions)
+        if need_virial:
+            if cell is None:
+                raise ValueError(
+                    "A periodic `cell` is required to obtain the virial by autograd."
+                )
+            if not cell.requires_grad:
+                raise ValueError(
+                    "This solver path computes no analytic virial, so the "
+                    "box-strain term (∂E/∂h)ᵀh must come from autograd — but `cell` "
+                    "does not require grad.  Set `cell.requires_grad_(True)` before "
+                    "the call and keep the graph (do not wrap in torch.no_grad)."
+                )
+            leaves.append(cell)
+
+        if not leaves:
+            return forces, None
+
+        grads = torch.autograd.grad(
+            energy.sum(),
+            leaves,
+            create_graph=torch.is_grad_enabled(),
+            retain_graph=True,
+        )
+        force = forces
+        if want_force:
+            grad_r = grads[0]
+            if grad_r is None:
+                raise RuntimeError("the energy does not depend on `positions`.")
+            force = -grad_r  # F = -dE/dr
+
+        virial = None
+        if need_virial:
+            grad_h = grads[-1]
+            if grad_h is None:
+                raise RuntimeError("the energy does not depend on `cell`.")
+            n_frames = int(energy.shape[0])
+            outer = torch.einsum("ic,id->icd", force, positions)  # [N,3,3]
+            pos_vir = torch.zeros(
+                n_frames, 3, 3, dtype=outer.dtype, device=outer.device
+            ).index_add_(0, batch, outer)
+            box_vir = -torch.einsum("fga,fgb->fab", grad_h, cell)
+            virial = pos_vir + box_vir
+
+        return force, virial
 
 
 class _DummyAtomwise(nn.Module):

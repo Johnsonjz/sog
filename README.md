@@ -8,6 +8,11 @@ This first version follows the LES-style package layout and uses a Gaussian reci
 - Top-level API: `src/sog/sog.py`
 - Optional BEC output: `src/sog/module/bec.py`
 
+**Integrating SOG into another MLIP?** Start at [`docs/`](docs/README.md) — the
+integration guide is written as a spec for a user (or their AI agent) porting
+SOG into a new framework: the four coupling points, the two integration modes,
+parameter export, and the LAMMPS plugin/adapter porting path.
+
 ## Kernel Parameterization (Important)
 
 The Gaussian kernel internally uses:
@@ -50,7 +55,9 @@ from sog import Sog
 
 model = Sog({"use_atomwise": False})
 
-r = torch.rand(16, 3)
+# `positions` needs grad when the solver path has no analytic forces
+# (the energy is differentiated); `cell` likewise for the virial.
+r = torch.rand(16, 3, requires_grad=True)
 q = torch.rand(16) - 0.5
 q = q - q.mean()
 cell = torch.eye(3).unsqueeze(0) * 12.0

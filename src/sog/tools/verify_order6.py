@@ -6,7 +6,6 @@ FFT energy converges to the direct k-sum, and forces match finite differences.
 (Negative weights are acceptable if the numerical energy is correct.)
 """
 import sys
-sys.path.insert(0, "/root/code/sog/src")
 import math
 import itertools
 import numpy as np

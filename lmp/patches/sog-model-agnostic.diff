@@ -1,0 +1,908 @@
+diff --git a/source/lmp/adapters/deepmd_charge_response.cpp b/source/lmp/adapters/deepmd_charge_response.cpp
+new file mode 100644
+index 0000000..d3e1973
+--- /dev/null
++++ b/source/lmp/adapters/deepmd_charge_response.cpp
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++#include "adapters/deepmd_charge_response.h"
++
++#ifdef SOG_WITH_DEEPMD
++
++#include "atom.h"
++#include "comm.h"
++#include "domain.h"
++#include "error.h"
++#include "fix_sog_response.h"
++#include "force.h"
++#include "lammps.h"
++#include "neigh_list.h"
++#include "neighbor.h"
++
++using namespace LAMMPS_NS;
++
++DeepMDChargeResponse::DeepMDChargeResponse(LAMMPS *lmp, FixSOGResponse *fix,
++                                           const std::string &model, bool fused,
++                                           int pair_index)
++    : lmp_(lmp), fix_(fix), fused_mode_(fused) {
++  if (!fix_)
++    lmp_->error->all(FLERR,
++                     "fix sog/response: deepmd adapter needs its owning fix "
++                     "(friend-legal InputNlist factory)");
++  // The standalone `dp_` is ONLY used by the non-fused fallback (the
++  // post_force catch branch).  In fused mode that branch is never reached,
++  // so skip this redundant, GPU-resident model load.
++  if (!fused_mode_) dp_.init(model, 0);
++
++  // locate the deepmd pair
++  pair_ = dynamic_cast<PairDeepMD *>(
++      lmp_->force->pair_match("deepmd", 1, pair_index > 0 ? pair_index : -1));
++  if (!pair_)
++    lmp_->error->all(FLERR, "fix sog/response requires pair_style deepmd");
++
++  // Fuse: have the pair retain its forward autograd graph so the charge-response
++  // correction is a VJP-only backward here, not a redundant second model forward.
++  // fused_mode goes further: the pair runs an energy-only+charge forward (no
++  // extended_force), and the fix does ONE combined backward for the total
++  // short-range+response force.
++  if (fused_mode_)
++    pair_->enable_charge_only_forward();
++  else
++    pair_->enable_charge_response_graph();
++
++  // deepmd unit conversions from the pair
++  ener_unit_cvt_factor_ = pair_->ener_unit_cvt_factor;
++  dist_unit_cvt_factor_ = pair_->dist_unit_cvt_factor;
++  force_unit_cvt_factor_ = pair_->force_unit_cvt_factor;
++
++  nchannels_ = pair_->ncharge_channels;
++  if (nchannels_ < 1) nchannels_ = 1;
++}
++
++void DeepMDChargeResponse::response(std::vector<double> &f_ext,
++                                    std::vector<double> &virial9,
++                                    const double *v_per_atom, int nlocal,
++                                    int nall, int nchannels) {
++  (void)nall; (void)nchannels;  // the pair knows the model's layout
++  std::vector<double> vp(v_per_atom,
++                         v_per_atom + static_cast<size_t>(nlocal) * nchannels_);
++
++  // ── Compute the charge-response correction ──
++  // Fast path: VJP on the pair's retained forward graph (no second forward, no
++  // model inputs).  Fallback: standalone forward+backward — its dcoord/dtype/
++  // dbox packing and the message-passing InputNlist + mapping are built ONLY
++  // here (deferred off the hot path; the cached path never reads them, so on
++  // the steady-state fast path this O(nall) per-step work is skipped entirely).
++  bool used_cached = false;
++  if (fused_mode_) {
++    // Tier-2: the pair ran the energy-only+charge forward (added zero force).
++    // This ONE combined backward yields the TOTAL short-range+response force
++    // (+ total virial).  No fallback: a missing retained graph would silently
++    // drop the short-range force, so the pair's exception propagates.
++    pair_->compute_combined_response_cached(f_ext, virial9, vp);
++    used_cached = true;
++  } else {
++    try {
++      pair_->compute_charge_response_cached(f_ext, virial9, vp);
++      used_cached = true;
++    } catch (deepmd_compat::deepmd_exception &) {
++      double **x = lmp_->atom->x;
++      int *type = lmp_->atom->type;
++      std::vector<double> dcoord(static_cast<size_t>(nall) * 3, 0.0);
++      std::vector<int> dtype(nall);
++      for (int ii = 0; ii < nall; ++ii) {
++        dtype[ii] = type[ii] - 1;
++        dcoord[ii * 3 + 0] = (x[ii][0] * dist_unit_cvt_factor_ + lmp_->domain->boxlo[0]);
++        dcoord[ii * 3 + 1] = (x[ii][1] * dist_unit_cvt_factor_ + lmp_->domain->boxlo[1]);
++        dcoord[ii * 3 + 2] = (x[ii][2] * dist_unit_cvt_factor_ + lmp_->domain->boxlo[2]);
++      }
++      std::vector<double> dbox(9, 0.0);
++      dbox[0] = (lmp_->domain->boxhi[0] - lmp_->domain->boxlo[0]) * dist_unit_cvt_factor_;
++      dbox[4] = (lmp_->domain->boxhi[1] - lmp_->domain->boxlo[1]) * dist_unit_cvt_factor_;
++      dbox[8] = (lmp_->domain->boxhi[2] - lmp_->domain->boxlo[2]) * dist_unit_cvt_factor_;
++      dbox[3] = lmp_->domain->xy * dist_unit_cvt_factor_;
++      dbox[6] = lmp_->domain->xz * dist_unit_cvt_factor_;
++      dbox[7] = lmp_->domain->yz * dist_unit_cvt_factor_;
++      NeighList *list = pair_->list;
++      int nghost_val = nall - nlocal;
++      // The comm-brick layout behind deepmd::InputNlist is protected; only
++      // FixSOGResponse (the declared friend of CommBrickDeepMD) can read it.
++      deepmd::InputNlist lmp_list = fix_->build_input_nlist(list);
++      lmp_list.set_mask(NEIGHMASK);
++      std::vector<int> mapping_vec(nall, -1);
++      if (lmp_->comm->nprocs == 1 && lmp_->atom->map_style != Atom::MAP_NONE) {
++        for (int ii = 0; ii < nall; ++ii)
++          mapping_vec[ii] = lmp_->atom->map(lmp_->atom->tag[ii]);
++        lmp_list.set_mapping(mapping_vec.data());
++      }
++      dp_.compute_charge_response(f_ext, virial9, vp, dcoord, dtype, dbox,
++                                  nghost_val, lmp_list, 0);
++    }
++  }
++  if (!used_cached && !warned_fallback_) {
++    warned_fallback_ = true;
++    lmp_->error->warning(FLERR,
++                         "fix sog/response: charge-response graph unavailable; "
++                         "using slower standalone forward (fusion inactive).");
++  }
++}
++
++#endif  // SOG_WITH_DEEPMD
+diff --git a/source/lmp/adapters/deepmd_charge_response.h b/source/lmp/adapters/deepmd_charge_response.h
+new file mode 100644
+index 0000000..78ce045
+--- /dev/null
++++ b/source/lmp/adapters/deepmd_charge_response.h
+@@ -0,0 +1,83 @@
++/* ----------------------------------------------------------------------
++   SOG adapter: DeepMD pair style as a SogChargeResponse.
++
++   Compiled only with -DSOG_WITH_DEEPMD.  Holds every deepmd-specific piece
++   of the charge-response fix: locating the pair, asking it to retain its
++   forward graph, the cached VJP (pair's retained graph), and the standalone
++   forward+backward fallback (its own DeepPot).  FixSOGResponse sees only
++   SogChargeResponse.
++
++   The C++-API extensions used here (set_retain_charge_graph,
++   compute_charge_response_cached, set_charge_only_forward,
++   compute_combined_response) exist only in this fork's api_cc
++   (DeepPot.h); hence the SOG_WITH_DEEPMD gate — a stock deepmd-kit
++   C-API build cannot satisfy them.
++------------------------------------------------------------------------- */
++
++#ifndef LMP_ADAPTERS_DEEPMD_CHARGE_RESPONSE_H
++#define LMP_ADAPTERS_DEEPMD_CHARGE_RESPONSE_H
++
++#ifdef SOG_WITH_DEEPMD
++
++#include <string>
++#include <vector>
++
++#include "pair_deepmd.h"
++#include "sog_charge_response.h"
++
++#ifdef DP_USE_CXX_API
++#ifdef LMPPLUGIN
++#include "DeepPot.h"
++#else
++#include "deepmd/DeepPot.h"
++#endif
++namespace deepmd_compat = deepmd;
++#else
++#ifdef LMPPLUGIN
++#include "deepmd.hpp"
++#else
++#include "deepmd/deepmd.hpp"
++#endif
++namespace deepmd_compat = deepmd::hpp;
++#endif
++
++namespace LAMMPS_NS {
++
++class DeepMDChargeResponse : public SogChargeResponse {
++ public:
++  // `fix` must be the owning FixSOGResponse: the fallback's InputNlist is
++  // assembled by FixSOGResponse::build_input_nlist, the only context that is a
++  // friend of CommBrickDeepMD (see fix_sog_response.h).
++  DeepMDChargeResponse(LAMMPS *lmp, FixSOGResponse *fix, const std::string &model,
++                       bool fused, int pair_index);
++  ~DeepMDChargeResponse() override = default;
++
++  double energy_unit_factor() const override { return ener_unit_cvt_factor_; }
++  double force_unit_factor() const override { return force_unit_cvt_factor_; }
++  int nchannels() const override { return nchannels_; }
++  bool fused_short_range() const override { return fused_mode_; }
++
++  void response(std::vector<double> &f_ext, std::vector<double> &virial9,
++                const double *v_per_atom, int nlocal, int nall,
++                int nchannels) override;
++
++ private:
++  LAMMPS *lmp_;
++  FixSOGResponse *fix_ = nullptr;  // back-pointer (friend-legal nlist factory)
++  PairDeepMD *pair_ = nullptr;
++  // The standalone DeepPot is ONLY used by the non-fused fallback (the
++  // post_force catch branch).  In fused mode that branch is never reached,
++  // so this redundant, GPU-resident model load is skipped.
++  deepmd_compat::DeepPot dp_;
++  bool fused_mode_ = false;
++  bool warned_fallback_ = false;
++  double ener_unit_cvt_factor_ = 1.0;
++  double dist_unit_cvt_factor_ = 1.0;
++  double force_unit_cvt_factor_ = 1.0;
++  int nchannels_ = 1;
++};
++
++}  // namespace LAMMPS_NS
++
++#endif  // SOG_WITH_DEEPMD
++#endif  // LMP_ADAPTERS_DEEPMD_CHARGE_RESPONSE_H
+diff --git a/source/lmp/adapters/deepmd_charge_source.h b/source/lmp/adapters/deepmd_charge_source.h
+new file mode 100644
+index 0000000..2db8339
+--- /dev/null
++++ b/source/lmp/adapters/deepmd_charge_source.h
+@@ -0,0 +1,47 @@
++/* ----------------------------------------------------------------------
++   SOG adapter: DeepMD pair style as a SogChargeSource.
++
++   Compiled only with -DSOG_WITH_DEEPMD (the build gate that makes
++   pair_deepmd.h available).  This is the entire deepmd-specific code the
++   kspace solver needs: dynamic_cast to the pair and a bounds guard.
++
++   Guard rationale: pair_deepmd.cpp initializes ncharge_channels = 0 and
++   only fills dcharge_multi when the model runs with latent_charge_to_q.
++   Without the guard, a latent_charge_to_q-less model used to read an empty
++   buffer out of bounds (dcharge_multi[i*nchannels] with nchannels garbage);
++   the adapter degrades to the native atom->q path instead.
++------------------------------------------------------------------------- */
++
++#ifndef LMP_ADAPTERS_DEEPMD_CHARGE_SOURCE_H
++#define LMP_ADAPTERS_DEEPMD_CHARGE_SOURCE_H
++
++#ifdef SOG_WITH_DEEPMD
++
++#include "pair_deepmd.h"
++#include "sog_charge_source.h"
++
++namespace LAMMPS_NS {
++
++class DeepMDChargeSource : public SogChargeSource {
++ public:
++  explicit DeepMDChargeSource(PairDeepMD *pair) : pair_(pair) {}
++
++  int nchannels() const override {
++    if (pair_ == nullptr) return 1;
++    if (pair_->dcharge_multi.empty()) return 1;  // latent_charge_to_q off
++    return pair_->ncharge_channels;
++  }
++
++  const double *charges() const override {
++    if (pair_ == nullptr || pair_->dcharge_multi.empty()) return nullptr;
++    return pair_->dcharge_multi.data();
++  }
++
++ private:
++  PairDeepMD *pair_;
++};
++
++}  // namespace LAMMPS_NS
++
++#endif  // SOG_WITH_DEEPMD
++#endif  // LMP_ADAPTERS_DEEPMD_CHARGE_SOURCE_H
+diff --git a/source/lmp/adapters/native_charge_response.h b/source/lmp/adapters/native_charge_response.h
+new file mode 100644
+index 0000000..76ed704
+--- /dev/null
++++ b/source/lmp/adapters/native_charge_response.h
+@@ -0,0 +1,48 @@
++/* ----------------------------------------------------------------------
++   SOG adapter: null charge response for fixed-charge MLIPs.
++
++   For a framework with no differentiable charge graph (∂q/∂r = ∂q/∂h = 0),
++   the charge-response correction is identically zero.  This adapter makes
++   that decision explicit — fix sog/response registers, runs, and adds a
++   documented zero — instead of the correction being silently absent.
++
++   Selected automatically by the build when SOG_WITH_DEEPMD is off; a
++   framework with a real graph implements SogChargeResponse itself.
++------------------------------------------------------------------------- */
++
++#ifndef LMP_ADAPTERS_NATIVE_CHARGE_RESPONSE_H
++#define LMP_ADAPTERS_NATIVE_CHARGE_RESPONSE_H
++
++#include "error.h"
++#include "sog_charge_response.h"
++
++namespace LAMMPS_NS {
++
++class NativeChargeResponse : public SogChargeResponse {
++ public:
++  explicit NativeChargeResponse(LAMMPS *lmp) {
++    // Once per process: the fix was requested but this build has no
++    // differentiable charge graph to respond with.
++    lmp->error->warning(FLERR,
++                        "fix sog/response: built without SOG_WITH_DEEPMD and "
++                        "no SogChargeResponse was registered — charge response "
++                        "is a no-op (fixed-charge adapter).");
++  }
++
++  double energy_unit_factor() const override { return 1.0; }
++  double force_unit_factor() const override { return 1.0; }
++  int nchannels() const override { return 1; }
++  bool fused_short_range() const override { return false; }
++
++  void response(std::vector<double> &f_ext, std::vector<double> &virial9,
++                const double *v_per_atom, int nlocal, int nall,
++                int nchannels) override {
++    (void)v_per_atom; (void)nlocal; (void)nchannels;
++    f_ext.assign(static_cast<size_t>(nall) * 3, 0.0);
++    virial9.assign(9, 0.0);
++  }
++};
++
++}  // namespace LAMMPS_NS
++
++#endif  // LMP_ADAPTERS_NATIVE_CHARGE_RESPONSE_H
+diff --git a/source/lmp/fix_sog_response.cpp b/source/lmp/fix_sog_response.cpp
+index 5a944cb..b95c4c5 100644
+--- a/source/lmp/fix_sog_response.cpp
++++ b/source/lmp/fix_sog_response.cpp
+@@ -10,26 +10,49 @@
+ #include "input.h"
+ #include "memory.h"
+ #include "modify.h"
+-#include "neigh_list.h"
+-#include "neighbor.h"
++#include "sog.h"
+ #include "update.h"
+ #include "variable.h"
+ 
++#ifdef SOG_WITH_DEEPMD
++#include "adapters/deepmd_charge_response.h"
++#include "neigh_list.h"
++#endif
++#include "adapters/native_charge_response.h"
++
+ using namespace LAMMPS_NS;
+ using namespace FixConst;
+ 
++namespace {
++
++// Factory for coupling #3.  The `model`/`fused`/`pair_index` keywords are
++// fix-level input syntax, forwarded to the adapter that understands them.
++// In a native build (no differentiable charge graph) the null adapter keeps
++// the fix functional and explicit about what it is (not) doing.
++// `fix` is the owning FixSOGResponse: the deepmd adapter needs it back for the
++// friend-legal build_input_nlist (see fix_sog_response.h).
++SogChargeResponse *create_charge_response(LAMMPS *lmp, FixSOGResponse *fix,
++                                          const std::string &model, bool fused,
++                                          int pair_index) {
++#ifdef SOG_WITH_DEEPMD
++  return new DeepMDChargeResponse(lmp, fix, model, fused, pair_index);
++#else
++  (void)fix; (void)model; (void)fused; (void)pair_index;
++  return new NativeChargeResponse(lmp);
++#endif
++}
++
++}  // namespace
++
+ FixSOGResponse::FixSOGResponse(LAMMPS *lmp, int narg, char **arg)
+-    : Fix(lmp, narg, arg),
+-      pair_deepmd(nullptr),
+-      sog_kspace(nullptr),
+-      nchannels(1),
+-      pair_deepmd_index(0) {
+-  if (narg < 4)
+-    error->all(FLERR,
+-               "Illegal fix sog/response command: need at least 'model' keyword");
+-  ener_unit_cvt_factor = 1.0;
+-  dist_unit_cvt_factor = 1.0;
+-  force_unit_cvt_factor = 1.0;
++    : Fix(lmp, narg, arg), sog_kspace(nullptr) {
++  // LAMMPS passes [ID, group, style, keywords...] (narg counts from the ID).
++  // All keywords are optional here: `model` is required only by the deepmd
++  // adapter (checked below when SOG_WITH_DEEPMD), and a native build accepts
++  // the bare `fix ID group sog/response` form.
++  std::string model;
++  bool fused_mode = false;
++  int pair_deepmd_index = 0;
+ 
+   int iarg = 3;
+   while (iarg < narg) {
+@@ -55,69 +78,36 @@ FixSOGResponse::FixSOGResponse(LAMMPS *lmp, int narg, char **arg)
+       error->all(FLERR, fmt::format("Unknown fix sog/response keyword: {}", arg[iarg]));
+     }
+   }
++#ifdef SOG_WITH_DEEPMD
+   if (model.empty()) error->all(FLERR, "fix sog/response: must specify 'model'");
++#endif
+ 
+-  // The second DeepPot `dp` is ONLY used by the non-fused fallback (the post_force catch branch).
+-  // In fused mode that branch is never reached, so skip this redundant, GPU-resident model load.
+-  if (!fused_mode) dp.init(model, 0);
+-
+-  // locate the deepmd pair
+-  int ix{0};
+-  pair_deepmd = dynamic_cast<PairDeepMD*>(
+-      force->pair_match("deepmd", 1, pair_deepmd_index > 0 ? pair_deepmd_index : -1));
+-  if (!pair_deepmd)
+-    error->all(FLERR, "fix sog/response requires pair_style deepmd");
+-
+-  // Fuse: have the pair retain its forward autograd graph so the charge-response
+-  // correction is a VJP-only backward here, not a redundant second model forward.
+-  // fused_mode goes further: the pair runs an energy-only+charge forward (no extended_force),
+-  // and this fix does ONE combined backward for the total short-range+response force.
+-  if (fused_mode)
+-    pair_deepmd->enable_charge_only_forward();
+-  else
+-    pair_deepmd->enable_charge_response_graph();
+-
+-  // deepmd unit conversions from the pair
+-  ener_unit_cvt_factor = pair_deepmd->ener_unit_cvt_factor;
+-  dist_unit_cvt_factor = pair_deepmd->dist_unit_cvt_factor;
+-  force_unit_cvt_factor = pair_deepmd->force_unit_cvt_factor;
+-
+-  nchannels = pair_deepmd->ncharge_channels;
+-  if (nchannels < 1) nchannels = 1;
+-
+-  // build type_idx_map (clone fix_dplr:160-200 pattern)
+-  {
+-    std::vector<std::string> type_names = pair_deepmd->type_names;
+-    std::vector<std::string> type_map_vec;
+-    std::string type_map_str;
+-    if (!fused_mode) dp.get_type_map(type_map_str);  // dp is uninitialized in fused mode; type_idx_map is unused there
+-    std::istringstream iss(type_map_str);
+-    std::string tn;
+-    while (iss >> tn) type_map_vec.push_back(tn);
+-    if (type_names.empty() || type_map_vec.empty()) {
+-      type_idx_map.resize(atom->ntypes);
+-      for (int ii = 0; ii < atom->ntypes; ++ii) type_idx_map[ii] = ii;
+-    } else {
+-      for (auto &tn_name : type_names) {
+-        bool found = false;
+-        for (size_t jj = 0; jj < type_map_vec.size(); ++jj) {
+-          if (type_map_vec[jj] == tn_name) {
+-            type_idx_map.push_back(static_cast<int>(jj));
+-            found = true;
+-            break;
+-          }
+-        }
+-        if (!found) type_idx_map.push_back(-1);
+-      }
+-    }
+-  }
++  charge_response = create_charge_response(lmp, this, model, fused_mode,
++                                           pair_deepmd_index);
+ 
+   comm_reverse = 3;  // dfcorr_buff: 3 doubles per atom
+   virial_global_flag = 1;
+   energy_global_flag = 1;
+ }
+ 
+-FixSOGResponse::~FixSOGResponse() {}
++FixSOGResponse::~FixSOGResponse() { delete charge_response; }
++
++#ifdef SOG_WITH_DEEPMD
++#ifdef DP_USE_CXX_API
++// Defined here (never in the adapter) because CommBrickDeepMD's friendship is
++// granted to this exact class: the protected comm-brick layout cannot be read
++// from a free function or from an adapter class, and the deepmd-kit repo that
++// declares the friendship must stay untouched.
++deepmd::InputNlist FixSOGResponse::build_input_nlist(NeighList *list) const {
++  CommBrickDeepMD *commdata = (CommBrickDeepMD *)comm;
++  return deepmd::InputNlist(
++      list->inum, list->ilist, list->numneigh, list->firstneigh,
++      commdata->nswap, commdata->sendnum, commdata->recvnum,
++      commdata->firstrecv, commdata->sendlist, commdata->sendproc,
++      commdata->recvproc, &world);
++}
++#endif
++#endif
+ 
+ int FixSOGResponse::setmask() {
+   int mask = 0;
+@@ -167,94 +157,38 @@ void FixSOGResponse::post_force(int vflag) {
+   if (nlocal <= 0) return;
+   int nall = nlocal + atom->nghost;
+ 
+-  // ── Read kspace potential v_i (needed by BOTH the cached VJP and the fallback) ──
++  // ── Read kspace potential v_i (needed by the response VJP) ──
+   const std::vector<double> &vpot = sog_kspace->get_potential();
+   if (static_cast<int>(vpot.size()) != nlocal)
+     error->all(FLERR, "sog/response: vpot size != nlocal (forgot set_want_potential?)");
+ 
+-  // Build v_per_atom [nlocal * nchannels] (v_i replicated per channel)
+-  std::vector<double> v_per_atom(nlocal * nchannels, 0.0);
++  // Build v_per_atom [nlocal * nchannels] (v_i replicated per channel) in
++  // MLIP energy units.
++  const int nchannels = charge_response->nchannels();
++  std::vector<double> v_per_atom(static_cast<size_t>(nlocal) * nchannels, 0.0);
++  const double inv_ener = 1.0 / charge_response->energy_unit_factor();
+   for (int i = 0; i < nlocal; ++i) {
+-    double vi = vpot[i] / ener_unit_cvt_factor;
++    const double vi = vpot[i] * inv_ener;
+     for (int c = 0; c < nchannels; ++c)
+       v_per_atom[i * nchannels + c] = vi;
+   }
+ 
+-  // ── Compute the charge-response correction ──
+-  // Fast path: VJP on the pair's retained forward graph (no second forward, no model inputs).
+-  // Fallback: standalone forward+backward — its dcoord/dtype/dbox packing and the message-passing
+-  // InputNlist + mapping are built ONLY here (deferred off the hot path; the cached path never
+-  // reads them, so on the steady-state fast path this O(nall) per-step work is skipped entirely).
++  // ── Compute the charge-response correction (framework-specific) ──
+   std::vector<double> dfcorr, dvcorr;
+-  bool used_cached = false;
+-  if (fused_mode) {
+-    // Tier-2: the pair ran the energy-only+charge forward (added zero force). This ONE combined
+-    // backward yields the TOTAL short-range+response force (+ total virial). No fallback: a missing
+-    // retained graph would silently drop the short-range force, so surface a hard error instead.
+-    pair_deepmd->compute_combined_response_cached(dfcorr, dvcorr, v_per_atom);
+-    used_cached = true;
+-  } else {
+-  try {
+-    pair_deepmd->compute_charge_response_cached(dfcorr, dvcorr, v_per_atom);
+-    used_cached = true;
+-  } catch (deepmd_compat::deepmd_exception &) {
+-    double **x = atom->x;
+-    int *type = atom->type;
+-    std::vector<double> dcoord(nall * 3, 0.0);
+-    std::vector<int> dtype(nall);
+-    for (int ii = 0; ii < nall; ++ii) {
+-      dtype[ii] = type[ii] - 1;
+-      dcoord[ii * 3 + 0] = (x[ii][0] * dist_unit_cvt_factor + domain->boxlo[0]);
+-      dcoord[ii * 3 + 1] = (x[ii][1] * dist_unit_cvt_factor + domain->boxlo[1]);
+-      dcoord[ii * 3 + 2] = (x[ii][2] * dist_unit_cvt_factor + domain->boxlo[2]);
+-    }
+-    std::vector<double> dbox(9, 0.0);
+-    dbox[0] = (domain->boxhi[0] - domain->boxlo[0]) * dist_unit_cvt_factor;
+-    dbox[4] = (domain->boxhi[1] - domain->boxlo[1]) * dist_unit_cvt_factor;
+-    dbox[8] = (domain->boxhi[2] - domain->boxlo[2]) * dist_unit_cvt_factor;
+-    dbox[3] = domain->xy * dist_unit_cvt_factor;
+-    dbox[6] = domain->xz * dist_unit_cvt_factor;
+-    dbox[7] = domain->yz * dist_unit_cvt_factor;
+-    NeighList *list = pair_deepmd->list;
+-    int nghost_val = nall - nlocal;
+-    CommBrickDeepMD *commdata = (CommBrickDeepMD *)comm;
+-    deepmd::InputNlist lmp_list(
+-        list->inum, list->ilist, list->numneigh, list->firstneigh,
+-        commdata->nswap, commdata->sendnum, commdata->recvnum,
+-        commdata->firstrecv, commdata->sendlist, commdata->sendproc,
+-        commdata->recvproc, &world);
+-    lmp_list.set_mask(NEIGHMASK);
+-    std::vector<int> mapping_vec(nall, -1);
+-    if (comm->nprocs == 1 && atom->map_style != Atom::MAP_NONE) {
+-      for (int ii = 0; ii < nall; ++ii)
+-        mapping_vec[ii] = atom->map(atom->tag[ii]);
+-      lmp_list.set_mapping(mapping_vec.data());
+-    }
+-    dp.compute_charge_response(dfcorr, dvcorr, v_per_atom, dcoord, dtype, dbox,
+-                               nghost_val, lmp_list, 0);
+-  }
+-  }
+-  static bool warned_fallback = false;
+-  if (!used_cached && !warned_fallback && comm->me == 0) {
+-    warned_fallback = true;
+-    error->warning(FLERR,
+-                   "fix sog/response: charge-response graph unavailable; using "
+-                   "slower standalone forward (fusion inactive).");
+-  }
++  charge_response->response(dfcorr, dvcorr, v_per_atom.data(), nlocal, nall,
++                            nchannels);
+ 
+   // Convert correction back to LAMMPS units
++  const double force_cvt = charge_response->force_unit_factor();
++  const double ener_cvt = charge_response->energy_unit_factor();
+   for (size_t ii = 0; ii < dfcorr.size(); ++ii)
+-    dfcorr[ii] *= force_unit_cvt_factor;
++    dfcorr[ii] *= force_cvt;
+   for (int ii = 0; ii < 9; ++ii)
+-    dvcorr[ii] *= ener_unit_cvt_factor;
++    dvcorr[ii] *= ener_cvt;
+ 
+   // ── Reverse-comm the ghost-atom correction forces ──
+   dfcorr_buff = dfcorr;
+-#if LAMMPS_VERSION_NUMBER >= 20220324
+   comm->reverse_comm(this, 3);
+-#else
+-  comm->reverse_comm_fix(this, 3);
+-#endif
+   std::copy(dfcorr_buff.begin(), dfcorr_buff.end(), dfcorr.begin());
+ 
+   // ── Accumulate into atom->f ──
+diff --git a/source/lmp/fix_sog_response.h b/source/lmp/fix_sog_response.h
+index f27f4ff..4839d93 100644
+--- a/source/lmp/fix_sog_response.h
++++ b/source/lmp/fix_sog_response.h
+@@ -8,30 +8,22 @@ FixStyle(sog/response, FixSOGResponse)
+ #ifndef LMP_FIX_SOG_RESPONSE_H
+ #define LMP_FIX_SOG_RESPONSE_H
+ 
+-#include <stdio.h>
+-
+-#include <map>
++#include <string>
++#include <vector>
+ 
+ #include "fix.h"
+-#include "pair_deepmd.h"
+-#include "sog.h"
+-#ifdef DP_USE_CXX_API
+-#ifdef LMPPLUGIN
+-#include "DeepPot.h"
+-#else
+-#include "deepmd/DeepPot.h"
+-#endif
+-namespace deepmd_compat = deepmd;
+-#else
+-#ifdef LMPPLUGIN
+-#include "deepmd.hpp"
+-#else
+-#include "deepmd/deepmd.hpp"
+-#endif
+-namespace deepmd_compat = deepmd::hpp;
++#include "sog_charge_response.h"
++
++#if defined(SOG_WITH_DEEPMD) && defined(DP_USE_CXX_API)
++namespace deepmd {
++class InputNlist;  // complete type lives in this fork's api_cc DeepPot.h
++}
+ #endif
+ 
+ namespace LAMMPS_NS {
++
++class NeighList;
++
+ class FixSOGResponse : public Fix {
+  public:
+   FixSOGResponse(class LAMMPS*, int, char**);
+@@ -47,19 +39,27 @@ class FixSOGResponse : public Fix {
+   void min_post_force(int) override;
+   int pack_reverse_comm(int, int, double*) override;
+   void unpack_reverse_comm(int, int*, double*) override;
+-  double ener_unit_cvt_factor, dist_unit_cvt_factor, force_unit_cvt_factor;
++
++#if defined(SOG_WITH_DEEPMD) && defined(DP_USE_CXX_API)
++  // ── Friend-legal deepmd InputNlist factory ──
++  // CommBrickDeepMD (deepmd-kit source/lmp/pair_deepmd.h) exposes its protected
++  // comm-brick layout (nswap/sendnum/sendlist/...) to `friend class PairDeepMD`
++  // and `friend class FixSOGResponse` only.  Every deepmd-specific helper in
++  // this tree lives in an adapter class that is NOT a friend, so the neighbor
++  // list the standalone charge-response fallback needs must be assembled inside
++  // a member of THIS class (deepmd-kit itself must not be modified).
++  deepmd::InputNlist build_input_nlist(NeighList* list) const;
++#endif
+ 
+  private:
+-  PairDeepMD* pair_deepmd;
+-  deepmd_compat::DeepPot dp;
+-  SOGKSpace* sog_kspace;
+-  std::string model;
+-  std::vector<int> type_idx_map;
++  // Framework-specific machinery behind coupling #3 (see
++  // sog_charge_response.h): a DeepMDChargeResponse when built with
++  // -DSOG_WITH_DEEPMD, NativeChargeResponse (documented no-op) otherwise.
++  SogChargeResponse* charge_response = nullptr;  // owned
++  class SOGKSpace* sog_kspace = nullptr;
+   std::vector<double> dfcorr_buff;
+-  int nchannels;
+-  int pair_deepmd_index;
+-  bool fused_mode = false;  // Tier-2: pair does energy-only forward, fix does one combined backward
+ };
++
+ }  // namespace LAMMPS_NS
+ 
+ #endif  // LMP_FIX_SOG_RESPONSE_H
+diff --git a/source/lmp/sog.cpp b/source/lmp/sog.cpp
+index 9e8d158..03e7d2a 100644
+--- a/source/lmp/sog.cpp
++++ b/source/lmp/sog.cpp
+@@ -33,7 +33,9 @@
+ #include "force.h"
+ #include "math_const.h"
+ #include "pair.h"
+-#include "pair_deepmd.h"
++#ifdef SOG_WITH_DEEPMD
++#include "adapters/deepmd_charge_source.h"
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -398,7 +400,11 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
+   triclinic_support = 0;
+ }
+ 
+-SOGKSpace::~SOGKSpace() { destroy_fft_plan(); }
++SOGKSpace::~SOGKSpace() {
++  destroy_fft_plan();
++  delete default_charge_source;
++  default_charge_source = nullptr;
++}
+ 
+ // ──────────────────────────────────────────────────────────────────────
+ // settings / parameters
+@@ -794,6 +800,17 @@ void SOGKSpace::init() {
+   two_charge();
+   pair_check();
+ 
++#ifdef SOG_WITH_DEEPMD
++  // Auto-create the deepmd charge-source adapter once, unless the user
++  // registered one explicitly.  The adapter's nchannels() guards on
++  // latent_charge_to_q so a model without multi-channel charges degrades
++  // cleanly to the native atom->q path.
++  if (charge_source == nullptr && default_charge_source == nullptr) {
++    auto *pair_dp = dynamic_cast<PairDeepMD *>(force->pair);
++    if (pair_dp != nullptr) default_charge_source = new DeepMDChargeSource(pair_dp);
++  }
++#endif
++
+   // Extract cutoff from pair style (needed for w0 computation)
+   int itmp = 0;
+   auto *p_cutoff = (double *)force->pair->extract("cut_coul", itmp);
+@@ -1591,9 +1608,12 @@ void SOGKSpace::precompute_green_functions() {
+ //   q_eff[i] = Σ_ch q_{i,ch}
+ // This gives the correct total charge density for the kspace solver.
+ void SOGKSpace::compute(int eflag, int vflag) {
+-  auto *pair_dp = dynamic_cast<PairDeepMD *>(force->pair);
+-  const int nchannels =
+-      (pair_dp != nullptr) ? pair_dp->ncharge_channels : 1;
++  // Charge-source resolution (see sog_charge_source.h): explicit registration
++  // wins; otherwise the deepmd adapter (when compiled in); otherwise atom->q,
++  // which any pair style can write.
++  SogChargeSource *src =
++      (charge_source != nullptr) ? charge_source : default_charge_source;
++  const int nchannels = (src != nullptr) ? src->nchannels() : 1;
+ 
+   const int nlocal = atom->nlocal;
+ 
+@@ -1605,6 +1625,10 @@ void SOGKSpace::compute(int eflag, int vflag) {
+   }
+ 
+   // ── Multi-channel: collapse to single effective charge ──
++  const double *q_multi = src->charges();
++  if (q_multi == nullptr)
++    error->all(FLERR, "SOG charge source reports multiple channels but no charge buffer");
++
+   // Save original charges and forces
+   std::vector<double> q_orig(nlocal);
+   std::vector<std::array<double, 3>> f_orig(nlocal);
+@@ -1617,10 +1641,10 @@ void SOGKSpace::compute(int eflag, int vflag) {
+ 
+   // Set atom->q to sum of all channels (total effective charge)
+   for (int i = 0; i < nlocal; ++i)
+-    atom->q[i] = pair_dp->dcharge_multi[i * nchannels];
++    atom->q[i] = q_multi[i * nchannels];
+   for (int ch = 1; ch < nchannels; ++ch) {
+     for (int i = 0; i < nlocal; ++i)
+-      atom->q[i] += pair_dp->dcharge_multi[i * nchannels + ch];
++      atom->q[i] += q_multi[i * nchannels + ch];
+   }
+ 
+   // Zero forces for kspace accumulation
+diff --git a/source/lmp/sog.h b/source/lmp/sog.h
+index 8d42859..566b6a3 100644
+--- a/source/lmp/sog.h
++++ b/source/lmp/sog.h
+@@ -27,6 +27,7 @@ KSpaceStyle(sog, SOGKSpace)
+ 
+ #include "kspace.h"
+ #include "lmpfftsettings.h"
++#include "sog_charge_source.h"
+ 
+ #include <array>
+ #include <vector>
+@@ -53,6 +54,12 @@ class SOGKSpace : public KSpace {
+   const std::vector<double> &get_potential() const { return vpot; }
+   void set_want_potential(bool v) { want_potential = v; }
+ 
++  // ── Charge source (coupling #2: MLIP -> SOG, see sog_charge_source.h) ──
++  // Explicitly register a source from the pair style; NULL (default) resolves
++  // per compute(): the deepmd adapter (SOG_WITH_DEEPMD) or native atom->q.
++  void set_charge_source(SogChargeSource *src) { charge_source = src; }
++  SogChargeSource *get_charge_source() const { return charge_source; }
++
+  protected:
+   // ── SOG kernel parameters ──
+   double b_param;        // b: geometric scaling factor
+@@ -99,6 +106,10 @@ class SOGKSpace : public KSpace {
+   std::vector<FFT_SCALAR> mesh_pot;       // k-space then real-space mesh potential u_j
+   std::vector<double> vpot;               // gathered per-atom potential v_i (nlocal)
+ 
++  // ── Charge source resolution ──
++  SogChargeSource *charge_source = nullptr;         // explicit set_charge_source() (not owned)
++  SogChargeSource *default_charge_source = nullptr; // deepmd adapter auto-created in init() (owned)
++
+   // ── Precomputed Green functions ──
+   std::vector<double> mesh_green_energy;
+   std::vector<double> mesh_green_force;
+diff --git a/source/lmp/sog_charge_response.h b/source/lmp/sog_charge_response.h
+new file mode 100644
+index 0000000..52f6042
+--- /dev/null
++++ b/source/lmp/sog_charge_response.h
+@@ -0,0 +1,56 @@
++/* ----------------------------------------------------------------------
++   SOG: abstract charge response — the derivatives SOG asks back from the MLIP.
++
++   Coupling point #3 of the SOG integration contract.  The kspace solver
++   produces a per-atom potential v_i = ∂E_k/∂q_i; the conservative force
++   needs the MLIP's charge derivative:
++
++       F_j = -Σ_i v_i · ∂q_i/∂r_j            (charge-response force)
++       W   = charge-response virial, 9 components (row-major F⊗r plus the
++             box-strain term), the same convention fix_sog_response tallies
++
++   Implement this for any framework whose charges depend differentiably on
++   positions and the box (i.e. the framework keeps a torch graph alive).
++   For fixed-charge models use NativeChargeResponse (adapters/) — it makes
++   "no response exists" explicit instead of silently dropping the term.
++
++   Unit contract: v_per_atom is passed in MLIP energy units and the outputs
++   are returned in MLIP units; FixSOGResponse converts both sides using
++   energy_unit_factor()/force_unit_factor().
++------------------------------------------------------------------------- */
++
++#ifndef LMP_SOG_CHARGE_RESPONSE_H
++#define LMP_SOG_CHARGE_RESPONSE_H
++
++#include <vector>
++
++namespace LAMMPS_NS {
++
++class SogChargeResponse {
++ public:
++  virtual ~SogChargeResponse() = default;
++
++  // MLIP energy unit -> LAMMPS energy unit.
++  virtual double energy_unit_factor() const = 0;
++  // MLIP force unit -> LAMMPS force unit.
++  virtual double force_unit_factor() const = 0;
++  // Number of latent charge channels the MLIP model emits.
++  virtual int nchannels() const = 0;
++  // True when the MLIP's forward already dropped the short-range force and
++  // response() returns the TOTAL short-range+response force/virial (fused
++  // mode).  False when the pair has already added the short-range force and
++  // response() returns only the charge-response correction.
++  virtual bool fused_short_range() const = 0;
++
++  // Compute the response.  v_per_atom has nlocal*nchannels entries
++  // (v_i replicated per channel, MLIP energy units).  f_ext receives the
++  // ghost-inclusive [nall*3] force; virial9 receives 9 components.
++  virtual void response(std::vector<double> &f_ext,     // out: [nall*3]
++                        std::vector<double> &virial9,   // out: [9]
++                        const double *v_per_atom,       // in: [nlocal*nchannels]
++                        int nlocal, int nall, int nchannels) = 0;
++};
++
++}  // namespace LAMMPS_NS
++
++#endif  // LMP_SOG_CHARGE_RESPONSE_H
+diff --git a/source/lmp/sog_charge_source.h b/source/lmp/sog_charge_source.h
+new file mode 100644
+index 0000000..2df1c60
+--- /dev/null
++++ b/source/lmp/sog_charge_source.h
+@@ -0,0 +1,41 @@
++/* ----------------------------------------------------------------------
++   SOG: abstract charge source — what the host MLIP hands the kspace solver.
++
++   Coupling point #2 of the SOG integration contract: per-atom latent
++   charges produced by the MLIP pair style, consumed by SOGKSpace::compute().
++   Any framework implements this one interface; the solver never looks at
++   the pair style's class name.
++
++   Contract:
++     * charges() returns a flat, channel-major buffer in LAMMPS units:
++         charges()[i * nchannels() + ch] = q_{i,ch}   for i in [0, nlocal)
++     * the buffer must be valid for the whole compute() call
++     * nchannels() <= 1 selects the native atom->q path (any pair style
++       that writes atom->q satisfies it — no SogChargeSource needed)
++
++   Resolution order inside SOGKSpace::compute():
++     1. a source registered explicitly via SOGKSpace::set_charge_source()
++     2. the deepmd adapter (only when compiled with -DSOG_WITH_DEEPMD)
++     3. atom->q (native single-channel path)
++------------------------------------------------------------------------- */
++
++#ifndef LMP_SOG_CHARGE_SOURCE_H
++#define LMP_SOG_CHARGE_SOURCE_H
++
++namespace LAMMPS_NS {
++
++class SogChargeSource {
++ public:
++  virtual ~SogChargeSource() = default;
++
++  // Number of latent charge channels; <=1 means "use atom->q".
++  virtual int nchannels() const = 0;
++
++  // Flat channel-major charge buffer, [i*nchannels + ch], i in [0, nlocal).
++  // May return nullptr only when nchannels() <= 1.
++  virtual const double *charges() const = 0;
++};
++
++}  // namespace LAMMPS_NS
++
++#endif  // LMP_SOG_CHARGE_SOURCE_H

@@ -6,9 +6,8 @@ Uses existing anchor data from phi_max_anchors.json + spot-checks on random conf
 """
 import sys, os, math, json
 import numpy as np
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 
-from phi_max_rule import (sigma_min_of, validity_phi, phi_max_from_law,
+from sog.tools.phi_max_rule import (sigma_min_of, validity_phi, phi_max_from_law,
                           FALLBACK_LAW, XI0)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -105,7 +104,7 @@ for order in (4, 6):
 # ── (3) Spot-check: bisection on one random config ─────────────────────
 print("\n--- (3) Spot-check: honest bisection on random config ---")
 try:
-    from verify_fft_vs_direct import make_test_system
+    from sog.tools.verify_fft_vs_direct import make_test_system
     from calibrate_phi_max_anchors import bisect_phi, rel_at
 
     # Generate a random system

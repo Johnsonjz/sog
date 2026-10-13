@@ -25,7 +25,6 @@ force-rel FALLBACK_LAW for grid sizing). The paper's 0.23/0.065 (order-4) and 0.
 the two u-series intrinsic-error tiers (b=2 C1 ~1/r_c^2 ; b~1.63 C2 ~1/r_c^3).
 CPU-only. Depends on the sog Python package (verify_phi_max helpers)."""
 import sys, math
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 import numpy as np
 
 # xi0 (spreading width constant) per CubeS2 order -- from sog_spline.h (kCubes2Xi4/6)
@@ -78,7 +77,7 @@ def phi_max_from_law(sigma_min, rcut, order, eps, law):
 def calibrate(amp, bandwidth, coords, q, box, rcut, order, fix_p=None):
     """Measure (C, p) of the grid-error law for THIS kernel on THIS config via FFT-vs-direct.
     If fix_p is given, only C is fit (more stable when few clean points, esp. order-6)."""
-    from verify_phi_max import energy_fft, reference_direct, realized_delta
+    from sog.tools.verify_phi_max import energy_fft, reference_direct, realized_delta
     amp = np.asarray(amp); bandwidth = np.asarray(bandwidth)
     e_ref = reference_direct(amp, bandwidth, coords, q, box)
     smin = sigma_min_of(bandwidth); lx = float(box[0, 0])
@@ -122,8 +121,8 @@ def phi_max_for_kernel(amp, bandwidth, coords, q, box, rcut=5.0, order=4, eps=1e
 
 if __name__ == "__main__":
     # Self-check: the self-calibrated rule reproduces the cons production phi choices.
-    from verify_cons_phi import AMP_CONS, BW_CONS
-    from fit_phi_max_law import load_water192
+    from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS
+    from sog.tools.fit_phi_max_law import load_water192
     coords, q, box, L = load_water192()
     smin = sigma_min_of(BW_CONS)
     print(f"cons kernel sigma_min={smin:.3f} A, r_c=5.0, real 192-water box")

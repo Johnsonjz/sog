@@ -33,7 +33,9 @@
 #include "force.h"
 #include "math_const.h"
 #include "pair.h"
-#include "pair_deepmd.h"
+#ifdef SOG_WITH_DEEPMD
+#include "adapters/deepmd_charge_source.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -398,7 +400,11 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
   triclinic_support = 0;
 }
 
-SOGKSpace::~SOGKSpace() { destroy_fft_plan(); }
+SOGKSpace::~SOGKSpace() {
+  destroy_fft_plan();
+  delete default_charge_source;
+  default_charge_source = nullptr;
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // settings / parameters
@@ -794,6 +800,17 @@ void SOGKSpace::init() {
   two_charge();
   pair_check();
 
+#ifdef SOG_WITH_DEEPMD
+  // Auto-create the deepmd charge-source adapter once, unless the user
+  // registered one explicitly.  The adapter's nchannels() guards on
+  // latent_charge_to_q so a model without multi-channel charges degrades
+  // cleanly to the native atom->q path.
+  if (charge_source == nullptr && default_charge_source == nullptr) {
+    auto *pair_dp = dynamic_cast<PairDeepMD *>(force->pair);
+    if (pair_dp != nullptr) default_charge_source = new DeepMDChargeSource(pair_dp);
+  }
+#endif
+
   // Extract cutoff from pair style (needed for w0 computation)
   int itmp = 0;
   auto *p_cutoff = (double *)force->pair->extract("cut_coul", itmp);
@@ -1084,7 +1101,7 @@ void SOGKSpace::ensure_fft_plan() {
   mesh_fft = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz, 0, mesh_nx - 1,
                         0, mesh_ny - 1, 0, mesh_nz - 1, 0, mesh_nx - 1, 0,
                         mesh_ny - 1, 0, mesh_nz - 1, 0, 0, &tmp,
-                        collective_flag);
+                        collective_flag, 0);
 
   // CubeS₂ (Form B) needs no spline-influence precompute: precompute_green_functions() builds the
   // separable variance-subtraction Green tables directly from amp/bandwidth. Only the legacy B-spline
@@ -1582,103 +1599,8 @@ void SOGKSpace::precompute_green_functions() {
   // (Per-step Green-function statistics / GF-diag prints removed — validated.)
 }
 
-// ── k=0 Q² cross-term correction (applied ONCE with total charge) ──
-// The k=0 energy has a term ∝ (Σq)² that is quadratic in the total charge.
-// For multi-channel latent charges, individual channels are NOT charge-neutral,
-// so applying the Q² term per-channel produces enormous unphysical energies/virials.
-// These helpers apply the correction once with the total Q across all channels.
-
-void SOGKSpace::apply_k0_correction_single_channel(int eflag, int vflag) {
-  // For single-channel, compute total qsum/qsqsum/kfac_eff and apply Q² term.
-  const int nlocal = atom->nlocal;
-  double *q = atom->q;
-  double qsum_local = 0.0, qsqsum_local = 0.0;
-  for (int i = 0; i < nlocal; ++i) {
-    qsum_local += q[i];
-    qsqsum_local += q[i] * q[i];
-  }
-  double qsum_all = 0.0, qsqsum_all = 0.0;
-  MPI_Allreduce(&qsum_local, &qsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
-  MPI_Allreduce(&qsqsum_local, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
-
-  // Regularized k=0 kernel: evaluate at smallest physical |k| to suppress
-  // high-m terms whose Gaussians are too wide to resolve real structure.
-  // Matches Python sog-lib gaussian.py k=0 correction.  k_min = 2π/max(Lx,Ly,Lz)
-  // for orthorhombic (the only box type currently supported).
-  double kfac_eff = 0.0;
-  {
-    const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
-    const double longest = std::max({lx, ly, lz});
-    const double k_min_sq =
-        (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
-    for (size_t m = 0; m < amp.size(); ++m)
-      kfac_eff += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
-  }
-
-  const double volume = mesh_lx * mesh_ly * mesh_lz;
-  const double qscale = force->qqrd2e * scale;
-
-  // Energy correction: E_k0 = qscale * K(0) * Q² / (2V)
-  // The self-energy (Σq² term) is already removed by the mesh-level rsi
-  // correction in sog_gpu_compute / CPU kspace.  Only the Q² cross-term
-  // needs explicit removal here.  When Q=0 (charge_neutral model) the
-  // correction is naturally zero as well.
-  if (eflag & ENERGY_GLOBAL) {
-    double dE = qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume);
-    energy += dE;
-    // (debug message removed — uncomment for diagnostics)
-  }
-
-  // Virial correction: W_diag = E_k0_cross for isotropic E∝1/V
-  if (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR)) {
-    double k0_cross = qscale * kfac_eff * qsum_all * qsum_all / (2.0 * volume);
-    virial[0] += k0_cross;
-    virial[1] += k0_cross;
-    virial[2] += k0_cross;
-    // (debug message removed — uncomment for diagnostics)
-  }
-}
-
-void SOGKSpace::apply_k0_correction_multi_channel(
-    double &energy_acc, double virial_acc[6],
-    int eflag, int vflag,
-    double qsum_total, double qsqsum_total) {
-  // Regularized k=0 kernel: evaluate at smallest physical |k| (see
-  // apply_k0_correction_single_channel for rationale).
-  double kfac_eff = 0.0;
-  {
-    const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
-    const double longest = std::max({lx, ly, lz});
-    const double k_min_sq =
-        (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
-    for (size_t m = 0; m < amp.size(); ++m)
-      kfac_eff += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
-  }
-
-  const double volume = mesh_lx * mesh_ly * mesh_lz;
-  const double qscale = force->qqrd2e * scale;
-
-  // Energy correction: E_k0 = qscale * K(0) * [Q² - (rsi)Σq²] / (2V)
-  // The self-energy (Σq² term) is already removed by the mesh-level rsi
-  // correction in sog_gpu_compute / CPU kspace.  Only the Q² cross-term
-  // needs explicit removal here.  When Q=0 (charge_neutral model) the
-  // correction is naturally zero as well.
-  if (eflag & ENERGY_GLOBAL) {
-    double dE = qscale * kfac_eff * qsum_total * qsum_total / (2.0 * volume);
-    energy_acc += dE;
-    // (debug message removed — uncomment for diagnostics)
-  }
-
-  // Virial correction
-  if (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR)) {
-    double k0_cross = qscale * kfac_eff * qsum_total * qsum_total / (2.0 * volume);
-    virial_acc[0] += k0_cross;
-    virial_acc[1] += k0_cross;
-    virial_acc[2] += k0_cross;
-    // (debug message removed — uncomment for diagnostics)
-  }
-}
-
+// k=0 correction removed: identically zero for charge-neutral (Q=0), matching Ewald/PPPM.
+// Self-energy is handled via diag_sum (k!=0) + W_self_strain (its strain derivative).
 // ── Multi-channel wrapper ──
 // Multi-channel latent charges: channels are NOT individually neutral.
 // Per-channel FFT would miss cross-terms ∝ ρ_ch(k)·ρ_{ch'}(-k).
@@ -1686,23 +1608,27 @@ void SOGKSpace::apply_k0_correction_multi_channel(
 //   q_eff[i] = Σ_ch q_{i,ch}
 // This gives the correct total charge density for the kspace solver.
 void SOGKSpace::compute(int eflag, int vflag) {
-  auto *pair_dp = dynamic_cast<PairDeepMD *>(force->pair);
-  const int nchannels =
-      (pair_dp != nullptr) ? pair_dp->ncharge_channels : 1;
+  // Charge-source resolution (see sog_charge_source.h): explicit registration
+  // wins; otherwise the deepmd adapter (when compiled in); otherwise atom->q,
+  // which any pair style can write.
+  SogChargeSource *src =
+      (charge_source != nullptr) ? charge_source : default_charge_source;
+  const int nchannels = (src != nullptr) ? src->nchannels() : 1;
 
   const int nlocal = atom->nlocal;
 
   // ── Single-channel: use atom->q directly ──
   if (nchannels <= 1) {
     compute_single(eflag, vflag);
-    // k=0 Q² cross-term: when charge_neutral=false, the training SOG kernel
-    // includes k=0, so the MD kspace must match. For neutral systems Q≈0
-    // and the correction is zero — safe to apply unconditionally.
-    apply_k0_correction_single_channel(eflag, vflag);
+    // k=0 Q² correction is applied inside compute_single (consistency with Python training).
     return;
   }
 
   // ── Multi-channel: collapse to single effective charge ──
+  const double *q_multi = src->charges();
+  if (q_multi == nullptr)
+    error->all(FLERR, "SOG charge source reports multiple channels but no charge buffer");
+
   // Save original charges and forces
   std::vector<double> q_orig(nlocal);
   std::vector<std::array<double, 3>> f_orig(nlocal);
@@ -1713,25 +1639,12 @@ void SOGKSpace::compute(int eflag, int vflag) {
     f_orig[i][2] = atom->f[i][2];
   }
 
-  // Compute total charge across all channels for k=0 correction
-  double qsum_total = 0.0, qsqsum_total = 0.0;
-  for (int i = 0; i < nlocal; ++i) {
-    double qi_total = 0.0;
-    for (int ch = 0; ch < nchannels; ++ch)
-      qi_total += pair_dp->dcharge_multi[i * nchannels + ch];
-    qsum_total += qi_total;
-    qsqsum_total += qi_total * qi_total;
-  }
-  double qsum_global = 0.0, qsqsum_global = 0.0;
-  MPI_Allreduce(&qsum_total, &qsum_global, 1, MPI_DOUBLE, MPI_SUM, world);
-  MPI_Allreduce(&qsqsum_total, &qsqsum_global, 1, MPI_DOUBLE, MPI_SUM, world);
-
   // Set atom->q to sum of all channels (total effective charge)
   for (int i = 0; i < nlocal; ++i)
-    atom->q[i] = pair_dp->dcharge_multi[i * nchannels];
+    atom->q[i] = q_multi[i * nchannels];
   for (int ch = 1; ch < nchannels; ++ch) {
     for (int i = 0; i < nlocal; ++i)
-      atom->q[i] += pair_dp->dcharge_multi[i * nchannels + ch];
+      atom->q[i] += q_multi[i * nchannels + ch];
   }
 
   // Zero forces for kspace accumulation
@@ -1739,14 +1652,16 @@ void SOGKSpace::compute(int eflag, int vflag) {
     atom->f[i][0] = 0.0; atom->f[i][1] = 0.0; atom->f[i][2] = 0.0;
   }
 
-  // Run single-channel kspace with combined charges
+  // Run single-channel kspace with combined charges.
+  // k=0 Q² correction is applied inside compute_single (consistency with Python training).
   compute_single(eflag, vflag);
 
-  // Apply k=0 Q² correction using total charge across all channels
-  // (charge_neutral=false training includes k=0; paper Eq. 3.4)
-  apply_k0_correction_multi_channel(energy, virial, eflag, vflag,
-                                    qsum_global, qsqsum_global);
-  // (debug message removed — uncomment for diagnostics)
+  if (comm->me == 0) {
+    std::string msg = fmt::format(
+        "  SOG multi-ch collapsed ({}ch): energy={:.6e} virial=[{:.4e} {:.4e} {:.4e} {:.4e} {:.4e} {:.4e}]\n",
+        nchannels, energy, virial[0], virial[1], virial[2], virial[3], virial[4], virial[5]);
+    utils::logmesg(lmp, msg);
+  }
 
   // Accumulate kspace forces (preserving original pair forces)
   for (int i = 0; i < nlocal; ++i) {
@@ -1776,6 +1691,9 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   int nlocal = atom->nlocal;
   if (nlocal <= 0) return;
   double **x = atom->x, *q = atom->q;
+  // The adjoint force needs the real-space potential irrespective of whether
+  // the caller also consumes per-atom charge-response potentials.
+  want_potential = true;
 
   // ── GPU path (plugin-internal raw CUDA + cuFFT) ──
   if (enable_gpu) {
@@ -1794,57 +1712,43 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       xx[i * 3 + 2] = x[i][2];
     }
     if (want_potential) vpot.assign(nlocal, 0.0);
-
-    // Charge-neutral mean subtraction is handled by the model's
-    // forward_lower_energy_charge (latent_charge = q - mean(q) per frame).
-    // The charges arriving at atom->q are already zero-mean.
-
     double qsqsum_gpu = 0.0;
     for (int i = 0; i < nlocal; ++i) qsqsum_gpu += q[i] * q[i];
     // (single-rank isolated kspace; MPI-reduce qsqsum when this path goes multi-rank)
     std::vector<double> vv(6), fk(3 * nlocal);
+    vpot.assign(nlocal, 0.0);
     energy = sog_gpu_compute(g, nlocal, xx.data(), boxlo, lx, ly, lz, q, qscale,
-                             spl, want_potential ? 1 : 0, fk.data(), vv.data(),
-                             want_potential ? vpot.data() : nullptr,
+                             spl, 1, fk.data(), vv.data(), vpot.data(),
                              self_coeff, qsqsum_gpu, remove_self_interaction ? 1 : 0);
     for (int i = 0; i < nlocal; ++i) {   // ADD kspace force to atom->f (pair already wrote its part)
       fx[i][0] += fk[i * 3 + 0];
       fx[i][1] += fk[i * 3 + 1];
       fx[i][2] += fk[i * 3 + 2];
     }
-
-    // ── k=0 contribution to per-atom potential v_i = ∂E_k0/∂q_i (GPU path) ──
-    // Only the cross-term ∂(Q²)/∂q_i = 2Q is needed; the self-energy
-    // derivative is already covered by the mesh rsi correction in
-    // sog_gpu_compute.  When Q=0 the correction is naturally zero.
-    if (want_potential) {
-      double qsum_local = 0.0;
-      for (int i = 0; i < nlocal; ++i) qsum_local += q[i];
-      double Q_total = 0.0;
-      MPI_Allreduce(&qsum_local, &Q_total, 1, MPI_DOUBLE, MPI_SUM, world);
-      const double volume = lx * ly * lz;
-      const double longest = std::max({lx, ly, lz});
-      const double k_min_sq =
-          (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
-      double kf = 0.0;
-      for (size_t m = 0; m < amp.size(); ++m)
-        kf += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
-      const double dv_perQ = qscale * kf / volume;
-      for (int i = 0; i < nlocal; ++i) {
-        vpot[i] += dv_perQ * Q_total;
-      }
-    }
     for (int j = 0; j < 6; ++j) virial[j] = vv[j];
+    // k=0: zero for neutral Q=0. GPU already handles diag_sum + W_self_strain.
     return;
   }
-
-  // Charge-neutral mean subtraction is handled by the model's
-  // forward_lower_energy_charge (latent_charge = q - mean(q) per frame).
-  // The charges arriving at atom->q are already zero-mean.
 
   if (atom->natoms != natoms_original) {
     qsum_qsq();
     natoms_original = atom->natoms;
+  }
+
+  // Recompute qsum/qsqsum from current atom->q: pair_style deepmd with
+  // latent_charge_to_q overwrites charges after kspace init, so the init-time
+  // qsqsum (from the data file, typically zero) is stale. Using stale qsqsum
+  // skips the kspace computation (qsqsum==0 early return) or applies a wrong
+  // self-energy correction. The per-step values at line 1738 serve the
+  // self-energy; this refresh only gates the early-return / FFT plan resize.
+  {
+    double qs = 0.0, q2s = 0.0;
+    for (int i = 0; i < nlocal; ++i) {
+      q2s += static_cast<double>(q[i]) * static_cast<double>(q[i]);
+      qs  += static_cast<double>(q[i]);
+    }
+    MPI_Allreduce(&q2s, &qsqsum, 1, MPI_DOUBLE, MPI_SUM, world);
+    MPI_Allreduce(&qs,  &qsum,  1, MPI_DOUBLE, MPI_SUM, world);
   }
 
   if (qsqsum == 0.0) {
@@ -1867,6 +1771,14 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   // TEMP validation hook: SOG_DUMP_POT=1 forces v_i computation + one-time dump,
   // so v_i = ∂E_k/∂q_i can be finite-difference validated before the fix exists.
   if (!want_potential && getenv("SOG_DUMP_POT")) want_potential = true;
+  // The production particle-mesh force is the exact derivative of the
+  // discrete mesh energy.  This requires the real-space potential and the
+  // coordinate derivatives of the spreading weights (PPPM ``ad`` form).
+  // Keep the potential path enabled even when charge-response output is not
+  // requested; otherwise the force would silently fall back to non-variational
+  // Fourier ``ik`` differentiation.
+  // The variational AD force differentiates the discrete mesh energy and needs
+  // the real-space mesh potential even when charge-response feedback is off.
 
   energy = 0.0;
   for (int j = 0; j < 6; ++j) virial[j] = 0.0;
@@ -2115,15 +2027,16 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
           sv_local[5] += gsv * ky * kz;
         }
 
-        const double vk_re = scaleinv * geff * rho_re;
-        const double vk_im = scaleinv * geff * rho_im;
-
-        mesh_gradx[2 * idx] = static_cast<FFT_SCALAR>(-kx * vk_im);
-        mesh_gradx[2 * idx + 1] = static_cast<FFT_SCALAR>(kx * vk_re);
-        mesh_grady[2 * idx] = static_cast<FFT_SCALAR>(-ky * vk_im);
-        mesh_grady[2 * idx + 1] = static_cast<FFT_SCALAR>(ky * vk_re);
-        mesh_gradz[2 * idx] = static_cast<FFT_SCALAR>(-kz * vk_im);
-        mesh_gradz[2 * idx + 1] = static_cast<FFT_SCALAR>(kz * vk_re);
+        if (spline_type < 4) {
+          const double vk_re = scaleinv * geff * rho_re;
+          const double vk_im = scaleinv * geff * rho_im;
+          mesh_gradx[2 * idx] = static_cast<FFT_SCALAR>(-kx * vk_im);
+          mesh_gradx[2 * idx + 1] = static_cast<FFT_SCALAR>(kx * vk_re);
+          mesh_grady[2 * idx] = static_cast<FFT_SCALAR>(-ky * vk_im);
+          mesh_grady[2 * idx + 1] = static_cast<FFT_SCALAR>(ky * vk_re);
+          mesh_gradz[2 * idx] = static_cast<FFT_SCALAR>(-kz * vk_im);
+          mesh_gradz[2 * idx + 1] = static_cast<FFT_SCALAR>(kz * vk_re);
+        }
 
         // ── Potential mesh u(k) = scaleinv·geff_energy·ρ(k) (no ik factor) ──
         // v_i = ∂E_k/∂q_i is the potential at atom i: gather this mesh with the same
@@ -2136,11 +2049,13 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     }
   }
 
-  // ── FFT backward (3 gradients) ──
-  mesh_fft->compute(mesh_gradx.data(), mesh_gradx.data(), FFT3d::BACKWARD);
-  mesh_fft->compute(mesh_grady.data(), mesh_grady.data(), FFT3d::BACKWARD);
-  mesh_fft->compute(mesh_gradz.data(), mesh_gradz.data(), FFT3d::BACKWARD);
-  // 4th inverse FFT: real-space mesh potential u_j (for v_i = ∂E_k/∂q_i)
+  // The adjoint CubeS2/QuadS force needs one inverse FFT of the mesh
+  // potential. The legacy B-spline control retains its three ik gradients.
+  if (spline_type < 4) {
+    mesh_fft->compute(mesh_gradx.data(), mesh_gradx.data(), FFT3d::BACKWARD);
+    mesh_fft->compute(mesh_grady.data(), mesh_grady.data(), FFT3d::BACKWARD);
+    mesh_fft->compute(mesh_gradz.data(), mesh_gradz.data(), FFT3d::BACKWARD);
+  }
   if (want_potential) {
     mesh_fft->compute(mesh_pot.data(), mesh_pot.data(), FFT3d::BACKWARD);
   }
@@ -2178,11 +2093,11 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double tx = fx - static_cast<double>(ix0);
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
-      double gx = 0.0, gy = 0.0, gz = 0.0, gpot = 0.0;
-      double wx[6], wy[6], wz[6];
-      quads_weights_1d(tx, xi, spline_type, wx);
-      quads_weights_1d(ty, xi, spline_type, wy);
-      quads_weights_1d(tz, xi, spline_type, wz);
+      double dtx = 0.0, dty = 0.0, dtz = 0.0, gpot = 0.0;
+      double wx[6], wy[6], wz[6], dwx[6], dwy[6], dwz[6];
+      quads_weights_derivs_1d(tx, xi, spline_type, wx, dwx);
+      quads_weights_derivs_1d(ty, xi, spline_type, wy, dwy);
+      quads_weights_derivs_1d(tz, xi, spline_type, wz, dwz);
       for (int a = 0; a < n1d; ++a) {
         const int igx = wrap_index(ix0 + offs[a], mesh_nx);
         for (int b = 0; b < n1d; ++b) {
@@ -2192,17 +2107,21 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
             const int igz = wrap_index(iz0 + offs[c], mesh_nz);
             const size_t idx = mesh_index(igx, igy, igz);
             const double w = wxy * wz[c];
-            gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-            gy += w * static_cast<double>(mesh_grady[2 * idx]);
-            gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-            if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+            const double u = static_cast<double>(mesh_pot[2 * idx]);
+            dtx += dwx[a] * wy[b] * wz[c] * u;
+            dty += wx[a] * dwy[b] * wz[c] * u;
+            dtz += wx[a] * wy[b] * dwz[c] * u;
+            gpot += w * u;
           }
         }
       }
       const double qi = q[i];
-      atom->f[i][0] += -qscale * qi * gx;
-      atom->f[i][1] += -qscale * qi * gy;
-      atom->f[i][2] += -qscale * qi * gz;
+      const double fxs_q = -qscale * qi * dtx * mesh_nx / mesh_lx;
+      const double fys_q = -qscale * qi * dty * mesh_ny / mesh_ly;
+      const double fzs_q = -qscale * qi * dtz * mesh_nz / mesh_lz;
+      atom->f[i][0] += fxs_q;
+      atom->f[i][1] += fys_q;
+      atom->f[i][2] += fzs_q;
       if (want_potential) vpot[i] = qscale * gpot;
     }
   } else if (spline_type >= 4) {
@@ -2226,43 +2145,43 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
 
-      double gx = 0.0, gy = 0.0, gz = 0.0;
+      double dtx = 0.0, dty = 0.0, dtz = 0.0;
       double gpot = 0.0;
 
       if (spline_type == 4) {
         for (int k = 0; k < kCubes2NumNodes4; ++k) {
           const auto &node = kCubes2Nodes4[k];
-          const double w = cubes2_weight_4(tx, ty, tz, node, xi);
+          const auto wg = cubes2_weight_grad_4(tx, ty, tz, node, xi);
+          const double w = wg.value;
           if (w == 0.0) continue;
           const int igx = wrap_index(ix0 + node.dx, mesh_nx);
           const int igy = wrap_index(iy0 + node.dy, mesh_ny);
           const int igz = wrap_index(iz0 + node.dz, mesh_nz);
           const size_t idx = mesh_index(igx, igy, igz);
-          gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-          gy += w * static_cast<double>(mesh_grady[2 * idx]);
-          gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-          if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+          const double u = static_cast<double>(mesh_pot[2 * idx]);
+          dtx += wg.d[0] * u; dty += wg.d[1] * u; dtz += wg.d[2] * u;
+          gpot += w * u;
         }
       } else {  // spline_type == 6 (88-node CubeS₂)
         for (int k = 0; k < kCubes2NumNodes6; ++k) {
           const auto &node = kCubes2Nodes6[k];
-          const double w = cubes2_weight_6(tx, ty, tz, node, xi);
+          const auto wg = cubes2_weight_grad_6(tx, ty, tz, node, xi);
+          const double w = wg.value;
           if (w == 0.0) continue;
           const int igx = wrap_index(ix0 + node.dx, mesh_nx);
           const int igy = wrap_index(iy0 + node.dy, mesh_ny);
           const int igz = wrap_index(iz0 + node.dz, mesh_nz);
           const size_t idx = mesh_index(igx, igy, igz);
-          gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-          gy += w * static_cast<double>(mesh_grady[2 * idx]);
-          gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-          if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+          const double u = static_cast<double>(mesh_pot[2 * idx]);
+          dtx += wg.d[0] * u; dty += wg.d[1] * u; dtz += wg.d[2] * u;
+          gpot += w * u;
         }
       }
 
       const double qi = q[i];
-      const double fxs = -qscale * qi * gx;
-      const double fys = -qscale * qi * gy;
-      const double fzs = -qscale * qi * gz;
+      const double fxs = -qscale * qi * dtx * mesh_nx / mesh_lx;
+      const double fys = -qscale * qi * dty * mesh_ny / mesh_ly;
+      const double fzs = -qscale * qi * dtz * mesh_nz / mesh_lz;
 
       atom->f[i][0] += fxs;
       atom->f[i][1] += fys;
@@ -2363,29 +2282,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     for (int i = 0; i < nlocal; ++i) {
       vpot[i] -= qscale * q[i] * (rsi_coef + self_c);
     }
-
-    // ── k=0 contribution to per-atom potential v_i = ∂E_k0/∂q_i ──
-    // E_k0 = qscale · kfac_eff · [Q² − rsi·Σq_j²] / (2V)
-    //   → v_i^{k0} = qscale · kfac_eff · [Q − rsi·q_i] / V
-    // Uses the SAME regularized kfac_eff as apply_k0_correction_single_channel.
-    {
-      double qsum_local_p = 0.0;
-      for (int i = 0; i < nlocal; ++i) qsum_local_p += q[i];
-      double Q_total = 0.0;
-      MPI_Allreduce(&qsum_local_p, &Q_total, 1, MPI_DOUBLE, MPI_SUM, world);
-      const double lx = domain->xprd, ly = domain->yprd, lz = domain->zprd;
-      const double longest = std::max({lx, ly, lz});
-      const double k_min_sq =
-          (2.0 * MY_PI / longest) * (2.0 * MY_PI / longest);
-      double kf = 0.0;
-      for (size_t m = 0; m < amp.size(); ++m)
-        kf += amp[m] * std::exp(-0.5 * bandwidth[m] * k_min_sq);
-      const double dv_perQ = qscale * kf / volume;
-      for (int i = 0; i < nlocal; ++i) {
-        vpot[i] += dv_perQ * Q_total;
-      }
-    }
-
     if (getenv("SOG_DUMP_POT") && comm->me == 0) {
       utils::logmesg(lmp, fmt::format(
           "  SOG vpot: tag[0]={} v[0]={:.10e}  tag[1]={} v[1]={:.10e}  "
@@ -2397,41 +2293,121 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
 
   // ── Virial ──
   if (want_virial) {
+    // ── Analytic Fourier virial: the COMPLETE strain-derivative of E_k ──
+    // W_αβ = ½·V·qscale · Σ_{k≠0} s²·|ρ̂(k)|²·(G_E·δ_αβ − K_v·k_α·k_β)
+    // where G_E = Σ a_m e^{−½β_m k²}, K_v = Σ a_m·β_m e^{−½β_m k²}.
+    // The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
+    // coordinate charge spreading + Form-B deconvolution (verified via analytic
+    // geometry proof + toy FD numerics, 1e-9). A Σ r⊗F formulation is therefore
+    // INCOMPLETE — it omits the box-explicit strain term that the
+    // analytic formula captures via d(1/V)/dε, d(k²)/dε, and dG_E/d(k²).
+    // This formula matches fastsog.cpp:1657-1660, PPPM vg, and the Python
+    // autograd virial (mesh_reciprocal_virial + direct k-sum FD).
     double vf_all[6] = {0.0};
-
-    // Fourier-space virial (primary, matches rbsog_intel & PPPM convention)
     MPI_Allreduce(fv_local.data(), vf_all, 6, MPI_DOUBLE, MPI_SUM, world);
-    // Scale Fourier virial: W = 0.5 * V * qscale * Σ s2 * |ρ|² * (ge·I - gv·k⊗k)
-    const double virial_scale = 0.5 * volume * qscale;
-    for (int j = 0; j < 6; ++j) virial[j] = virial_scale * vf_all[j];
+    for (int j = 0; j < 6; ++j) virial[j] = 0.5 * volume * qscale * vf_all[j];
 
-    // Self-energy strain-derivative (the term the reciprocal formula omits, ~2.5%→~0.5%):
+    // Self-energy strain-derivative: the self-energy removal contributes
+    // ZERO force (∂qsq/∂r=0 when charges are fixed), but its STRAIN
+    // derivative is non-zero and must be added for the complete virial.
     //   W_self_αβ = (qscale·qsqsum/2V)·(Σ K_v·k_α k_β − δ_αβ·Σ K)
-    // Σ K_v·k_α k_β = sv_all, Σ K = diag_sum_all (both raw mesh sums, no s2). Isotropic
-    // δ part matches the energy's −qsqsum·diag_sum/(2V); the k=0 correction is separate.
+    // The prefactor is qscale·qsqsum/(2V) — NO /3. The /3 was a code-
+    // evolution artifact (the diagnostic dump variable correctly stored
+    // the un-divided prefactor, but the actual computation incorrectly
+    // divided by 3). Verified against fastsog.cpp, Python mesh_reciprocal_virial,
+    // and the analytic W_self strain-derivative formula.
     if (remove_self_interaction) {
       double sv_all[6] = {0.0};
       MPI_Allreduce(sv_local.data(), sv_all, 6, MPI_DOUBLE, MPI_SUM, world);
       double diag_sum_all_v = 0.0;
       MPI_Allreduce(&diag_sum_local, &diag_sum_all_v, 1, MPI_DOUBLE, MPI_SUM, world);
-      const double self_pref = qscale * qsqsum_all / (2.0 * volume);
-      virial[0] += self_pref * (sv_all[0] - diag_sum_all_v);
-      virial[1] += self_pref * (sv_all[1] - diag_sum_all_v);
-      virial[2] += self_pref * (sv_all[2] - diag_sum_all_v);
-      virial[3] += self_pref * sv_all[3];
-      virial[4] += self_pref * sv_all[4];
-      virial[5] += self_pref * sv_all[5];
+      const double sv_pref = qscale * qsqsum_all / (2.0 * volume);
+      virial[0] += sv_pref * (sv_all[0] - diag_sum_all_v);
+      virial[1] += sv_pref * (sv_all[1] - diag_sum_all_v);
+      virial[2] += sv_pref * (sv_all[2] - diag_sum_all_v);
+      virial[3] += sv_pref * sv_all[3];
+      virial[4] += sv_pref * sv_all[4];
+      virial[5] += sv_pref * sv_all[5];
     }
 
-    // NOTE: k=0 Q² virial correction is NOT applied here per-channel.
-    // It is applied once in the multi-channel wrapper using total Q.
+    // ── Diagnostic virial dump (full decomposition) ──
+    if (getenv("SOG_DUMP_VIRIAL") && comm->me == 0) {
+      auto fmt_v6 = [](const double *v) {
+        return fmt::format("{:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e}",
+                           v[0], v[1], v[2], v[3], v[4], v[5]);
+      };
+      // vf_all = analytic Fourier virial (NOW PRODUCTION; was diagnostic-only)
+      double vf_all_dump[6] = {0.0};
+      MPI_Allreduce(fv_local.data(), vf_all_dump, 6, MPI_DOUBLE, MPI_SUM, world);
+      utils::logmesg(lmp, fmt::format("SOG_VIRIAL_KSPACE fv_local (analytic, production): {}\n", fmt_v6(vf_all_dump)));
+      // sv_all = self-stress accumulators
+      double sv_all_dump[6] = {0.0};
+      MPI_Allreduce(sv_local.data(), sv_all_dump, 6, MPI_DOUBLE, MPI_SUM, world);
+      double diag_dump = 0.0;
+      MPI_Allreduce(&diag_sum_local, &diag_dump, 1, MPI_DOUBLE, MPI_SUM, world);
+      double self_pref_dump = qscale * qsqsum_all / (2.0 * volume);
+      utils::logmesg(lmp, fmt::format("SOG_VIRIAL_KSPACE W_self pref={:.6e} diag={:.6e}\n", self_pref_dump, diag_dump));
+      utils::logmesg(lmp, fmt::format("SOG_VIRIAL_KSPACE sv_all: {}\n", fmt_v6(sv_all_dump)));
+      // Final kspace virial = analytic reciprocal + W_self (k=0 zero for neutral Q=0)
+      utils::logmesg(lmp, fmt::format("SOG_VIRIAL_KSPACE final: {}\n", fmt_v6(virial)));
+    }
   }
 
-  // NOTE: k=0 terms are intentionally NOT applied here. Charge neutrality
-  // is enforced at the model layer (lr_fitting._corr_head subtracts the
-  // per-frame per-channel mean), so Σq = 0 and the k=0 Q² cross-term
-  // vanishes. This keeps sog.cpp bit-for-bit consistent with the native
-  // LAMMPS fastsog.cpp, which has no k=0 correction.
+  // ── k=0 mode: zero for charge-neutral systems (Q=0) ──
+  // Classical Ewald and PPPM both exclude k=0 for neutral systems — the
+  // self-energy is purely real-space (volume-independent) and its strain
+  // derivative vanishes. For SOG, the mesh k≠0 self-energy is corrected via
+  // diag_sum above; the k=0 contribution is identically zero when Q=0.
+  // (The former apply_k0_correction_single_channel was a training-consistency
+  // artifact from Python's charge_neutral=false convention, not physically required.)
+
+  // ── Diagnostic kspace dump ──
+  if (getenv("SOG_DUMP_KSPACE") && comm->me == 0) {
+    const double vscale = 0.5 * volume * qscale;
+    double K_at_1 = 0.0, Kv_at_1 = 0.0, deconv_at_1 = 0.0, rho2_at_1 = 0.0;
+    int idx_1 = mesh_index(1, 0, 0);  // k=(dkx, 0, 0)
+    if (idx_1 < mesh_green_energy.size()) {
+      K_at_1 = mesh_green_self[idx_1];
+      Kv_at_1 = mesh_green_self_virial[idx_1];
+      deconv_at_1 = mesh_green_energy[idx_1] / (K_at_1 + 1e-300);
+      rho2_at_1 = static_cast<double>(mesh_fft_work[2*idx_1]) * static_cast<double>(mesh_fft_work[2*idx_1])
+                + static_cast<double>(mesh_fft_work[2*idx_1+1]) * static_cast<double>(mesh_fft_work[2*idx_1+1]);
+    }
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: qscale={:.8e} vol={:.6e} vscale={:.8e} s2={:.8e} rho_scale={:.8e}\n",
+        qscale, volume, vscale, s2, rho_scale));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: energy_local={:.8e} diag_sum_local={:.8e}\n",
+        energy_local, diag_sum_local));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: fv_local[0]={:.8e} fv_local[1]={:.8e} fv_local[2]={:.8e}\n",
+        fv_local[0], fv_local[1], fv_local[2]));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: sv_local[0]={:.8e} sv_local[1]={:.8e} sv_local[2]={:.8e}\n",
+        sv_local[0], sv_local[1], sv_local[2]));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: energy (after scaling)={:.8e} qsqsum_all={:.8e}\n",
+        energy, qsqsum_all));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: virial[0]={:.8e} virial[1]={:.8e} virial[2]={:.8e}\n",
+        virial[0], virial[1], virial[2]));
+    utils::logmesg(lmp, fmt::format(
+        "SOG_DUMP: k=(1,0,0): K={:.6e} Kv={:.6e} deconv={:.6e} |rho|^2={:.6e}\n",
+        K_at_1, Kv_at_1, deconv_at_1, rho2_at_1));
+    // Print a few Green function values
+    for (int test_ix = 0; test_ix <= 3 && test_ix < mesh_nx; ++test_ix) {
+      size_t tidx = mesh_index(test_ix, 0, 0);
+      int km = test_ix - mesh_nx * (2*test_ix / mesh_nx);
+      double kxt = (MY_2PI/mesh_lx) * km;
+      double gf_e = (tidx < mesh_green_energy.size()) ? mesh_green_energy[tidx] : -1.0;
+      double gf_v = (tidx < mesh_green_virial.size()) ? mesh_green_virial[tidx] : -1.0;
+      double gf_s = (tidx < mesh_green_self.size()) ? mesh_green_self[tidx] : -1.0;
+      double gf_sv = (tidx < mesh_green_self_virial.size()) ? mesh_green_self_virial[tidx] : -1.0;
+      utils::logmesg(lmp, fmt::format(
+          "SOG_DUMP: grid[{}]: km={} kx={:.6e} G_E={:.6e} G_V={:.6e} K_raw={:.6e} Kv_raw={:.6e}\n",
+          test_ix, km, kxt, gf_e, gf_v, gf_s, gf_sv));
+    }
+  }
 }
 
 /* ----------------------------------------------------------------------
@@ -2575,7 +2551,7 @@ void SOGKSpace::enumerate_direct_kvecs()
      3. Energy   E = (qscale/V) · 2 · Σ_{k half} K(k²) · |S(k)|²  − self
      4. Forces   F_i = q_i · (qscale/V) · 2 · Σ_k K(k²) · k ·
                        [cos(k·r_i)·S_im[k] − sin(k·r_i)·S_re[k]]
-     5. Virial   from per-atom stress r_i ⊗ F_i
+     5. Virial   analytic Fourier form (rbsog-npt.md eq 82): W_αβ = [K·δ_αβ − K_v·k_α·k_β]·|S|²
 ------------------------------------------------------------------------- */
 void SOGKSpace::compute_direct(int eflag, int vflag)
 {
@@ -2671,6 +2647,17 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     double kx_cart = kx_d[ik] * dkx, ky_cart = ky_d[ik] * dky, kz_cart = kz_d[ik] * dkz;
     double weight = prefac_f * kfac_d[ik];
 
+    // Fourier virial (analytic, rbsog-npt.md eq 82): W_αβ = [K·δ_αβ − K_v·k_α·k_β]·|S|²
+    if (want_virial) {
+      const double kv = kfac_virial_d[ik];
+      vv[0] += (kfac - kv * kx_cart * kx_cart) * Ssq;
+      vv[1] += (kfac - kv * ky_cart * ky_cart) * Ssq;
+      vv[2] += (kfac - kv * kz_cart * kz_cart) * Ssq;
+      vv[3] += -kv * kx_cart * ky_cart * Ssq;
+      vv[4] += -kv * kx_cart * kz_cart * Ssq;
+      vv[5] += -kv * ky_cart * kz_cart * Ssq;
+    }
+
     for (int i = 0; i < nlocal; ++i) {
       double cx = csx[i], cy = csy[i], cz = csz[i];
       double vx = sx * snx[i], vy = sy * sny[i], vz = sz * snz[i];
@@ -2692,8 +2679,16 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     for (int i = 0; i < nlocal; ++i) qsqsum += q[i] * q[i];
     double qsqsum_all;
     MPI_Allreduce(&qsqsum, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
-    if (remove_self_interaction)
-      etot -= qscale * self_coeff * qsqsum_all;
+    if (remove_self_interaction) {
+      // Compute diag_sum from direct k-vectors (half-sphere: each k counted once).
+      // Full-sum self-energy = -qscale/(2V)·Σ_{full} K(k²)·qsqsum
+      //                    = -qscale/(2V)·(2·Σ_{half} K)·qsqsum
+      //                    = -qscale·diag_sum·qsqsum/V
+      double diag_sum_half = 0.0;
+      for (size_t ik = 0; ik < (size_t)nk_direct; ++ik)
+        diag_sum_half += kfac_d[ik];
+      etot -= qscale * qsqsum_all * diag_sum_half / volume;
+    }
     energy = etot;
   }
 
@@ -2704,20 +2699,12 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     f[i][2] += fz[i];
   }
 
-  // ── Virial: r ⊗ F accumulation ──
+  // ── Virial: analytic Fourier form (rbsog-npt.md eq 82), NOT r⊗F ──
+  // `vv` is accumulated over the half-sphere k-vectors using the already-MPI-reduced
+  // structure factors (identical on every rank), so it needs no Allreduce — same
+  // convention as `etot` above.
   if (want_virial) {
-    for (int i = 0; i < nlocal; ++i) {
-      vv[0] += x[i][0] * fx[i];
-      vv[1] += x[i][1] * fy[i];
-      vv[2] += x[i][2] * fz[i];
-      vv[3] += x[i][0] * fy[i];
-      vv[4] += x[i][0] * fz[i];
-      vv[5] += x[i][1] * fz[i];
-    }
-    // MPI reduce virial
-    double vv_all[6];
-    MPI_Allreduce(vv, vv_all, 6, MPI_DOUBLE, MPI_SUM, world);
-    for (int j = 0; j < 6; ++j) virial[j] = vv_all[j];
+    for (int j = 0; j < 6; ++j) virial[j] = prefac_en * vv[j];
   }
 }
 

@@ -101,12 +101,11 @@ def test_periodic_nufft_direct_internal_consistency():
     r = r @ cell
 
     state = core._prepare_triclinic_state(r, q, cell)
-    e_nufft = core._compute_periodic_nufft(
-        state["r_in"],
-        state["q"],
-        state["kfac"],
-        state["output_shape"],
-        state["volume"],
+    # _compute_periodic_nufft_bundle takes the prepared state and returns
+    # (energy, force, virial) -- it replaced the old scalar-returning
+    # _compute_periodic_nufft.
+    e_nufft, _force, _virial = core._compute_periodic_nufft_bundle(
+        state, need_force=False, need_virial=False,
     )
     e_direct = core._compute_periodic_direct(
         state["r_raw"],

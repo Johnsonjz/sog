@@ -20,8 +20,6 @@ Builds on the already-passing sog/verify_fft_vs_direct.py (imports its helpers).
 Run:  python verify_phi_max.py
 """
 import sys
-sys.path.insert(0, "/root/code/sog/src")
-sys.path.insert(0, "/root/code/sog")
 
 import math
 import numpy as np
@@ -32,8 +30,8 @@ torch.set_default_dtype(torch.float64)
 from sog.module.gaussian import Gaussian
 from sog.module.cubes2_spline import XI_4, XI_6  # actual ξ₀ used by the FFT
 from sog.module.cubes2_fft import _resolve_grid
-import verify_fft_vs_direct as vd
-from verify_fft_vs_direct import (
+from sog.tools import verify_fft_vs_direct as vd
+from sog.tools.verify_fft_vs_direct import (
     geometric_amp_bw, make_test_system, energy_direct,
     AMP_TRAINED, BW_TRAINED, B, SIGMA, M, RCUT, E2_PER_ANGSTROM_TO_EV,
 )

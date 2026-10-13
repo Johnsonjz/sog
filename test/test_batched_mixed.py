@@ -7,19 +7,27 @@
 
 CPU-only, tiny system, no GPU needed.
 """
-import math, os, sys
+
 import torch
 
-# Add sog/src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
-from sog.module.gaussian import Gaussian
-from sog.module.gaussian import SOG_DEFAULT_B, SOG_DEFAULT_SIGMA, SOG_DEFAULT_M
+from sog.module.gaussian import (
+    Gaussian,
+    SOG_DEFAULT_B,
+    SOG_DEFAULT_M,
+    SOG_DEFAULT_SIGMA,
+)
 
 dtype = torch.float64
-torch.manual_seed(42)
 
-# ── helpers ──
+# nloc patterns: uniform (Level 0), mild mix (Level 1 full pad), large outlier
+# (Level 2 greedy grouping).
+MIXED_PATTERNS = [
+    [4, 4, 4, 4],
+    [3, 5, 4, 4, 6, 3, 5],
+    [2, 2, 2, 20, 2, 2],
+]
+
+
 def make_gaussian(amp=None, bw=None, **kwargs):
     """Create a minimal Gaussian kernel."""
     g = Gaussian(
@@ -59,130 +67,94 @@ def run_per_frame_loop(g, q, r, cell, batch, nf):
             continue
         # Use compute_bundle with batched disabled to force per-frame loop
         g._enable_batched_direct = False
-        e = g(q=q_now, r=r_now, cell=cell[bid:bid+1])
+        e = g(q=q_now, r=r_now, cell=cell[bid:bid + 1])
         energies.append(e.squeeze())
     g._enable_batched_direct = True
     return torch.stack(energies)
 
 
-# ── (1) energy identity: padded batched ≡ per-frame loop ──
-print("=== (1) energy identity: padded batched vs per-frame loop ===")
-for nloc_by_frame in [
-    [4, 4, 4, 4],            # uniform (Level 0)
-    [3, 5, 4, 4, 6, 3, 5],  # mild mix (Level 1: waste ~57% for max=6)
-    [2, 2, 2, 20, 2, 2],    # large outlier (Level 2: waste >> 1.0)
-]:
-    nf = len(nloc_by_frame)
-    q, r, cell, batch, _, _ = build_mixed_batch(
-        nloc_by_frame, nch=2, box_scale=10.0 + sum(nloc_by_frame) * 0.05
-    )
-    g = make_gaussian()
-    g._enable_batched_direct = True
+def test_energy_identity_padded_vs_loop():
+    """(1) padded batched ≡ per-frame loop, all three grouping levels."""
+    torch.manual_seed(42)
+    for nloc_by_frame in MIXED_PATTERNS:
+        nf = len(nloc_by_frame)
+        q, r, cell, batch, _, _ = build_mixed_batch(
+            nloc_by_frame, nch=2, box_scale=10.0 + sum(nloc_by_frame) * 0.05
+        )
+        g = make_gaussian()
+        g._enable_batched_direct = True
 
-    # Batched path (with padding if needed)
-    e_batched = g(q=q, r=r, cell=cell, batch=batch).detach()
+        e_batched = g(q=q, r=r, cell=cell, batch=batch).detach()
+        e_loop = run_per_frame_loop(g, q, r, cell, batch, nf)
 
-    # Per-frame loop reference
-    e_loop = run_per_frame_loop(g, q, r, cell, batch, nf)
-
-    diff = (e_batched - e_loop).abs().max().item()
-    status = "PASS" if diff < 1e-12 else "FAIL"
-    nloc_str = f"nloc={nloc_by_frame}"
-    print(f"  {nloc_str:45s}  max|dE|={diff:.2e}  [{status}]")
-    if diff >= 1e-12:
-        print(f"    batched: {e_batched}")
-        print(f"    loop:    {e_loop}")
-        raise AssertionError(f"Energy mismatch for nloc={nloc_by_frame}")
-
-print("  -> ALL PASS\n")
+        diff = (e_batched - e_loop).abs().max().item()
+        assert diff < 1e-12, (
+            f"energy mismatch for nloc={nloc_by_frame}: max|dE|={diff:.2e}\n"
+            f"  batched: {e_batched}\n  loop: {e_loop}"
+        )
 
 
-# ── (2) force identity via autograd ──
-print("=== (2) force identity: grad(padded batched) vs grad(per-frame) ===")
-for nloc_by_frame, desc in [
-    ([3, 5, 4, 4, 6, 3, 5], "Level 1 (full pad)"),
-    ([2, 2, 2, 20, 2, 2], "Level 2 (grouped)"),
-]:
-    nf = len(nloc_by_frame)
-    q, r, cell, batch, _, nloc_list = build_mixed_batch(
-        nloc_by_frame, nch=1, box_scale=10.0
-    )
-    g = make_gaussian()
-    g._enable_batched_direct = True
+def test_force_identity_via_autograd():
+    """(2) grad(padded batched) ≡ grad(per-frame loop)."""
+    torch.manual_seed(42)
+    for nloc_by_frame, desc in [
+        ([3, 5, 4, 4, 6, 3, 5], "Level 1 (full pad)"),
+        ([2, 2, 2, 20, 2, 2], "Level 2 (grouped)"),
+    ]:
+        nf = len(nloc_by_frame)
+        q, r, cell, batch, _, _ = build_mixed_batch(
+            nloc_by_frame, nch=1, box_scale=10.0
+        )
+        g = make_gaussian()
+        g._enable_batched_direct = True
 
-    # Batched forces
-    r_b = r.clone().requires_grad_(True)
-    e_b = g(q=q, r=r_b, cell=cell, batch=batch).sum()
-    f_b = -torch.autograd.grad(e_b, r_b, create_graph=False)[0]
+        r_b = r.clone().requires_grad_(True)
+        e_b = g(q=q, r=r_b, cell=cell, batch=batch).sum()
+        f_b = -torch.autograd.grad(e_b, r_b, create_graph=False)[0]
 
-    # Per-frame forces
-    r_l = r.clone().requires_grad_(True)
-    e_l = run_per_frame_loop(g, q, r_l, cell, batch, nf).sum()
-    f_l = -torch.autograd.grad(e_l, r_l, create_graph=False)[0]
+        r_l = r.clone().requires_grad_(True)
+        e_l = run_per_frame_loop(g, q, r_l, cell, batch, nf).sum()
+        f_l = -torch.autograd.grad(e_l, r_l, create_graph=False)[0]
 
-    max_df = (f_b - f_l).abs().max().item()
-    rms_df = (f_b - f_l).pow(2).mean().sqrt().item()
-    status = "PASS" if max_df < 1e-10 else "FAIL"
-    print(f"  {desc:35s}  max|dF|={max_df:.2e}  rms|dF|={rms_df:.2e}  [{status}]")
-    if max_df >= 1e-10:
-        raise AssertionError(f"Force mismatch for {desc}")
-
-print("  -> ALL PASS\n")
+        max_df = (f_b - f_l).abs().max().item()
+        assert max_df < 1e-10, (
+            f"force mismatch for {desc} (nloc={nloc_by_frame}): max|dF|={max_df:.2e}"
+        )
 
 
-# ── (3) charge_neutral_lambda correctness with mixed nloc ──
-print("=== (3) charge_neutral_lambda with mixed nloc ===")
-# Use non-zero lambda and verify padded batched matches per-frame
-g_cnl = make_gaussian(charge_neutral_lambda=1.0)
-for nloc_by_frame in [[3, 5, 4, 4], [2, 2, 20, 2]]:
-    nf = len(nloc_by_frame)
-    q, r, cell, batch, _, _ = build_mixed_batch(
-        nloc_by_frame, nch=1, box_scale=10.0
-    )
-    g_cnl._enable_batched_direct = True
-    e_b = g_cnl(q=q, r=r, cell=cell, batch=batch).detach()
-    e_l = run_per_frame_loop(g_cnl, q, r, cell, batch, nf)
-    diff = (e_b - e_l).abs().max().item()
-    status = "PASS" if diff < 1e-12 else "FAIL"
-    print(f"  nloc={nloc_by_frame!s:30s}  max|dE|={diff:.2e}  [{status}]")
-    if diff >= 1e-12:
-        # If this fails, the q_f.mean fix might be wrong
-        print(f"    batched: {e_b}")
-        print(f"    loop:    {e_l}")
-        raise AssertionError("charge_neutral_lambda mismatch with mixed nloc")
-
-print("  -> ALL PASS\n")
+def test_charge_neutral_lambda_mixed_nloc():
+    """(3) charge_neutral_lambda path with mixed nloc."""
+    torch.manual_seed(42)
+    g_cnl = make_gaussian(charge_neutral_lambda=1.0)
+    for nloc_by_frame in [[3, 5, 4, 4], [2, 2, 20, 2]]:
+        nf = len(nloc_by_frame)
+        q, r, cell, batch, _, _ = build_mixed_batch(
+            nloc_by_frame, nch=1, box_scale=10.0
+        )
+        g_cnl._enable_batched_direct = True
+        e_b = g_cnl(q=q, r=r, cell=cell, batch=batch).detach()
+        e_l = run_per_frame_loop(g_cnl, q, r, cell, batch, nf)
+        diff = (e_b - e_l).abs().max().item()
+        assert diff < 1e-12, (
+            f"charge_neutral_lambda mismatch for nloc={nloc_by_frame}: "
+            f"max|dE|={diff:.2e}\n  batched: {e_b}\n  loop: {e_l}"
+        )
 
 
-# ── (4) greedy grouping structure ──
-print("=== (4) greedy grouping correctness ===")
-from sog.module.gaussian import Gaussian as G
-
-# Test that grouping produces expected structure
-test_cases = [
-    ([4, 4, 4, 4], [[(0,4),(1,4),(2,4),(3,4)]]),   # all same → 1 group
-    ([2, 2, 20, 2], None),                            # outlier → 2 groups
-    ([10, 12, 100, 11], None),                        # outlier → 2 groups
-]
-for nloc_list, expected in test_cases:
-    groups = G._greedy_group_by_nloc(nloc_list, max_waste=1.0)
-    n_groups = len(groups)
-    # For cases with expected=None, just check every frame appears exactly once
-    all_indices = sorted([idx for g in groups for idx, _ in g])
-    ok = all_indices == list(range(len(nloc_list)))
-
-    if expected is not None:
-        ok = ok and groups == expected
-
-    if ok:
-        print(f"  nloc={nloc_list!s:30s}  groups={n_groups}  [PASS]")
-    else:
-        print(f"  nloc={nloc_list!s:30s}  groups={n_groups} → {groups}  [FAIL]")
-        if expected:
-            print(f"    expected: {expected}")
-        raise AssertionError("Grouping mismatch")
-
-print("  -> ALL PASS\n")
-
-print("=" * 60)
-print("OVERALL: ALL PASS")
+def test_greedy_grouping_structure():
+    """(4) greedy grouping: every frame exactly once; uniform -> single group."""
+    test_cases = [
+        ([4, 4, 4, 4], [[(0, 4), (1, 4), (2, 4), (3, 4)]]),  # all same -> 1 group
+        ([2, 2, 20, 2], None),                               # outlier -> 2 groups
+        ([10, 12, 100, 11], None),                           # outlier -> 2 groups
+    ]
+    for nloc_list, expected in test_cases:
+        groups = Gaussian._greedy_group_by_nloc(nloc_list, max_waste=1.0)
+        all_indices = sorted(idx for g in groups for idx, _ in g)
+        assert all_indices == list(range(len(nloc_list))), (
+            f"nloc={nloc_list}: frames not covered exactly once: {groups}"
+        )
+        if expected is not None:
+            assert groups == expected, (
+                f"nloc={nloc_list}: expected {expected}, got {groups}"
+            )

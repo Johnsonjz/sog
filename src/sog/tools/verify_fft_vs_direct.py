@@ -10,7 +10,6 @@ Two kernels tested:
   2. Trained (non-geometric): amp/bw from the trained checkpoint (first 4 modified)
 """
 import sys
-sys.path.insert(0, "/root/code/sog/src")
 
 import math
 import numpy as np

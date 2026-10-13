@@ -10,7 +10,6 @@ Reference: direct k-sum E = (1/2V) Σ_{k≠0} K(k²)|S(k)|² (converged, no self
 Run over a grid-refinement sequence to show convergence to `direct`.
 """
 import sys
-sys.path.insert(0, "/root/code/sog/src")
 import math
 import numpy as np
 import torch

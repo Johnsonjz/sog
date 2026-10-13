@@ -5,16 +5,26 @@ to calibrate a GENERAL phi_max rule  phi_max = (eps/C_nu)^(1/p_nu) * sigma_min/r
 The paper has NO phi_max formula (Table III is empirical); this builds the accuracy-inverted rule.
 CPU-only. Run with dp_dev python."""
 import sys, math
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 import numpy as np, torch
 torch.set_default_dtype(torch.float64)
-from verify_phi_max import energy_fft, reference_direct, sigma_min, realized_delta, AMP_MD, BW_MD
-from verify_fft_vs_direct import geometric_amp_bw, make_test_system, B, SIGMA, M, RCUT
-from verify_cons_phi import AMP_CONS, BW_CONS
+from sog.tools.verify_phi_max import energy_fft, reference_direct, sigma_min, realized_delta, AMP_MD, BW_MD
+from sog.tools.verify_fft_vs_direct import geometric_amp_bw, make_test_system, B, SIGMA, M, RCUT
+from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS
 
 
-def load_water192():
-    path = "/root/code/deepmd-example/water-scan0/lmp/replicate/data/water_charge_192.lmp"
+def load_water192(path=None):
+    """Load the 192-atom water box used by the φ_max calibration/verification panels.
+
+    Data resolution: explicit ``path`` → ``$SOG_WATER192_DATA`` → the copy that
+    ships with the package (``sog/tools/data/water_charge_192.lmp``).  Charges
+    are the fixed convention O = −0.2, H = +0.1 (neutral).
+    """
+    import os
+    if path is None:
+        path = os.environ.get("SOG_WATER192_DATA")
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "data", "water_charge_192.lmp")
     coords, types, L = [], [], None
     inatoms = False
     for line in open(path):

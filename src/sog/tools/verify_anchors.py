@@ -2,14 +2,13 @@
 """Verify the phi_max general method reproduces the paper's Table III b=2/1.63 anchors,
 and calibrate the (C_nu, p_nu) constants (CubeS2) for the sog.cpp closed-form. CPU-only."""
 import sys, math
-sys.path.insert(0, "/root/code/sog/src"); sys.path.insert(0, "/root/code/sog")
 import numpy as np, torch
 torch.set_default_dtype(torch.float64)
-from verify_phi_max import energy_fft, reference_direct, sigma_min
-from verify_fft_vs_direct import geometric_amp_bw, RCUT, M
-from verify_cons_phi import AMP_CONS, BW_CONS
-from fit_phi_max_law import load_water192
-from phi_max_rule import calibrate, phi_max_from_law, validity_phi
+from sog.tools.verify_phi_max import energy_fft, reference_direct, sigma_min
+from sog.tools.verify_fft_vs_direct import geometric_amp_bw, RCUT, M
+from sog.tools.verify_cons_phi import AMP_CONS, BW_CONS
+from sog.tools.fit_phi_max_law import load_water192
+from sog.tools.phi_max_rule import calibrate, phi_max_from_law, validity_phi
 
 COORDS, Q, BOX, _ = load_water192()
 

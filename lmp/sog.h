@@ -27,6 +27,7 @@ KSpaceStyle(sog, SOGKSpace)
 
 #include "kspace.h"
 #include "lmpfftsettings.h"
+#include "sog_charge_source.h"
 
 #include <array>
 #include <vector>
@@ -45,10 +46,6 @@ class SOGKSpace : public KSpace {
   void setup() override;
   void compute(int eflag, int vflag) override;
   void compute_single(int eflag, int vflag);
-  void apply_k0_correction_single_channel(int eflag, int vflag);
-  void apply_k0_correction_multi_channel(double &energy_acc, double virial_acc[6],
-                                         int eflag, int vflag,
-                                         double qsum_total, double qsqsum_total);
   double memory_usage() override;
 
   // Per-atom electrostatic potential v_i = ∂E_k/∂q_i (filled in compute_single when
@@ -56,6 +53,12 @@ class SOGKSpace : public KSpace {
   // ∂q/∂r backward (DPLR analog of pppm_dplr::get_fele()).
   const std::vector<double> &get_potential() const { return vpot; }
   void set_want_potential(bool v) { want_potential = v; }
+
+  // ── Charge source (coupling #2: MLIP -> SOG, see sog_charge_source.h) ──
+  // Explicitly register a source from the pair style; NULL (default) resolves
+  // per compute(): the deepmd adapter (SOG_WITH_DEEPMD) or native atom->q.
+  void set_charge_source(SogChargeSource *src) { charge_source = src; }
+  SogChargeSource *get_charge_source() const { return charge_source; }
 
  protected:
   // ── SOG kernel parameters ──
@@ -102,6 +105,10 @@ class SOGKSpace : public KSpace {
   bool want_potential = false;            // gate: fill vpot in compute_single
   std::vector<FFT_SCALAR> mesh_pot;       // k-space then real-space mesh potential u_j
   std::vector<double> vpot;               // gathered per-atom potential v_i (nlocal)
+
+  // ── Charge source resolution ──
+  SogChargeSource *charge_source = nullptr;         // explicit set_charge_source() (not owned)
+  SogChargeSource *default_charge_source = nullptr; // deepmd adapter auto-created in init() (owned)
 
   // ── Precomputed Green functions ──
   std::vector<double> mesh_green_energy;

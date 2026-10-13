@@ -1102,7 +1102,14 @@ def compute_cubes2_fft(
                 green_virial=green_virial,
                 kfac=kfac_fft,
                 kfacv=kfacv_fft,
-                KXr=KX2, KYr=KY2, KZr=KZ2,
+                # KX2/KY2/KZ2 live on the [nx//2+1, ny, nz] meshgrid; every other
+                # argument (rho_sq, green_*, rfft_w) is in rfft layout
+                # [nz, ny, nx//2+1].  Without the permute the elementwise products
+                # inside mesh_reciprocal_virial broadcast against the wrong axes
+                # (and, off a cubic grid, fail outright).
+                KXr=KX2.permute(2, 1, 0),
+                KYr=KY2.permute(2, 1, 0),
+                KZr=KZ2.permute(2, 1, 0),
                 rfft_w=_rfft_w2,
                 vol=volume_val,
                 s2=s2_val,

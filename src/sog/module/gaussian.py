@@ -14,12 +14,19 @@ except (ImportError, ModuleNotFoundError):
     HAS_PYTORCH_FINUFFT = False
     pytorch_finufft = None
 
+# The kernel constants have a single definition site in ``sog.kernel``; they are
+# re-exported here so ``from sog.module.gaussian import RCUT_TO_SIGMA`` keeps
+# working.  ``kernel`` is a leaf module and does not import this one.
+from ..kernel import (  # noqa: E402
+    RCUT_TO_SIGMA,
+    SOG_DEFAULT_B,
+    SOG_DEFAULT_M,
+    SOG_DEFAULT_SIGMA,
+    compute_w0,
+)
+
 
 E2_PER_ANGSTROM_TO_EV = 14.3996454784255
-SOG_DEFAULT_B = 2
-SOG_DEFAULT_SIGMA = 2.180230445405648
-SOG_DEFAULT_M = 12
-RCUT_TO_SIGMA = 1.9892536839080267  # r_c/σ for b=2, C¹ continuity (midtown-sog.md)
 
 
 def _as_1d_tensor_keep_input(value: object) -> torch.Tensor:
@@ -42,26 +49,8 @@ def _is_differentiable_tensor(value: object) -> bool:
 
 
 def _compute_w0(r0: float, b: float, nterms: int = 500, tol: float = 1e-14) -> float:
-    """Compute w0 — real-space correction factor (fastsog.cpp:318-328).
-
-    w0 = (1/G(1,r0)) * (1/(2*ln(b)*r0) - Σ b^{-i} * G(1, b^{-i}*r0))
-    where G(sigma, r) = exp(-r²/(2*sigma²))/sqrt(2*pi*sigma²)
-
-    Uses adaptive convergence: stops when |term| < tol * |sum|.
-    """
-    import math as _math
-    G = lambda s, r: _math.exp(-r * r / (2.0 * s * s)) / _math.sqrt(2.0 * _math.pi * s * s)
-    s = 0.0
-    abs_sum = 0.0
-    for i in range(1, nterms + 1):
-        bi = b ** (-i)
-        term = bi * G(1.0, bi * r0)
-        s += term
-        abs_sum += abs(term)
-        if i >= 10 and abs(term) < tol * max(abs_sum, 1e-30):
-            break
-    w0 = (1.0 / G(1.0, r0)) * (1.0 / (2.0 * _math.log(b) * r0) - s)
-    return w0
+    """Deprecated alias for :func:`sog.kernel.compute_w0`; see there for the formula."""
+    return compute_w0(r0, b, nterms=nterms, tol=tol)
 
 
 class Gaussian(nn.Module):
@@ -465,6 +454,16 @@ class Gaussian(nn.Module):
         virial_list = [] if compute_virial else None
 
         explicit_all = True
+        # Set when a frame produced forces but no virial, so the caller must fall
+        # back to autograd for the virial rather than receiving a partial one.
+        virial_missing = False
+        # Whether differentiating the returned energy reproduces the forces.
+        # True for every branch except the CubeS2/QuadS analytic-force branch,
+        # whose energy comes from the plain solver (its charge spreading uses
+        # torch.floor, truncating the autograd gradient) -- the custom
+        # Cubes2FFTFunction exists precisely to avoid that, and is used only when
+        # forces are NOT requested.
+        energy_differentiable = True
 
         # ── Precompute per-frame scalars ONCE per batch (not per frame) to avoid the
         #    ~6 GPU→CPU syncs/frame that dominate the direct k-sum for small systems
@@ -603,6 +602,9 @@ class Gaussian(nn.Module):
                     "forces": None,
                     "virial": None,
                     "used_explicit_derivatives": False,
+                    # This branch is built from differentiable ops only, so a
+                    # caller may safely differentiate the energy itself.
+                    "autograd_safe": True,
                 }
 
         for bid in bids_py:
@@ -653,6 +655,7 @@ class Gaussian(nn.Module):
                     )
 
                     if need_force or compute_virial:
+                        energy_differentiable = False
                         result = _cubes2_fft(
                             q=state["q"].reshape(-1),
                             r=state["r_raw"],
@@ -714,6 +717,9 @@ class Gaussian(nn.Module):
                 # forces are taken explicitly, like the CubeS₂ force branch).
                 from .quads_fft import compute_quads_fft as _quads_fft
 
+                # Unlike CubeS2 there is no energy-only variant of this branch, so
+                # its energy always comes from the floor-truncated solver.
+                energy_differentiable = False
                 assert box_now is not None
                 nq_local = q_now.shape[1] if q_now.dim() > 1 else 1
                 pot_now = 0.0
@@ -758,10 +764,16 @@ class Gaussian(nn.Module):
             elif periodic and need_force and self.use_nufft and HAS_PYTORCH_FINUFFT:
                 assert box_now is not None
                 state = self._prepare_triclinic_state(r_now, q_now, box_now, _volume=volume)
-                pot_now, force_now, virial_now = self._compute_periodic_nufft_bundle(
+                # No explicit virial from this branch: it returned only the
+                # position part (Fᵀr), omitting the box-strain term -(∂E/∂h)ᵀh, and
+                # on a strained cell that term dominates.  This branch's energy IS
+                # differentiable (autograd reproduces these explicit forces to
+                # ~1e-16), so the virial is left to the caller's autograd path --
+                # see the ``autograd_safe`` note in the return value below.
+                pot_now, force_now, _virial_unused = self._compute_periodic_nufft_bundle(
                     state,
                     need_force=True,
-                    need_virial=compute_virial,
+                    need_virial=False,
                 )
 
                 # Self-energy (matching Ewald's -α·Σq²/√π): -Σq² · Σ_{k≠0}K/(2V)
@@ -770,14 +782,11 @@ class Gaussian(nn.Module):
 
                 pot_now = pot_now * self.norm_factor
                 force_now = force_now * self.norm_factor
-                if virial_now is not None:
-                    virial_now = virial_now * self.norm_factor
 
                 if force_full is not None:
                     force_full[mask] = force_now
                 if virial_list is not None:
-                    assert virial_now is not None
-                    virial_list.append(virial_now)
+                    virial_missing = True
             else:
                 if need_force:
                     explicit_all = False
@@ -819,13 +828,26 @@ class Gaussian(nn.Module):
             virial_out = None
         else:
             force_out = force_full
-            virial_out = torch.stack(virial_list, dim=0) if virial_list is not None else None
+            virial_out = torch.stack(virial_list, dim=0) if virial_list else None
+        if virial_missing:
+            # Some frame produced forces but no virial.  Drop the partial virial
+            # rather than mixing what was computed with what was not.
+            virial_out = None
 
         return {
             "energy": energy_out,
             "forces": force_out,
             "virial": virial_out,
             "used_explicit_derivatives": used_explicit,
+            # Whether differentiating ``energy`` reproduces forces and yields the
+            # correct virial.  False as soon as ONE frame took a CubeS2/QuadS
+            # analytic-force branch, whose energy comes from the floor-truncated
+            # solver; in that mixed case the other frames' explicit forces are
+            # discarded too, so the energy is not a reliable autograd source.
+            # Note this is NOT the negation of ``used_explicit_derivatives``: the
+            # NUFFT branch supplies explicit forces from an energy that is itself
+            # perfectly differentiable.
+            "autograd_safe": bool(energy_differentiable),
         }
 
     def compute_potential_realspace(self, r_raw: torch.Tensor, q: torch.Tensor) -> torch.Tensor:

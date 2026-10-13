@@ -21,6 +21,12 @@ def test_sog_forward_latent_charge_path():
 
     cell = torch.eye(3, dtype=torch.float64).unsqueeze(0) * 10.0
 
+    # This configuration takes the direct k-sum path, which computes no analytic
+    # derivatives -- Sog.forward differentiates the energy instead, so the
+    # positions (and the cell, for the virial) must carry grad.
+    r.requires_grad_(True)
+    cell.requires_grad_(True)
+
     out = model(
         positions=r,
         cell=cell,

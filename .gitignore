@@ -23,3 +23,10 @@ venv/
 
 # Notebook caches
 .ipynb_checkpoints/
+# LAMMPS test artifacts
+lmp/tests/*.log
+lmp/tests/*.dump
+# LAMMPS artifacts
+log.lammps
+traj*.lammpstrj
+lmp/build_deepmd/

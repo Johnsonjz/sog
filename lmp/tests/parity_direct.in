@@ -1,0 +1,47 @@
+# Python<->LAMMPS numeric parity on the exact direct k-sum path.
+# pair_style zero contributes nothing, so thermo pe == kspace elong and the
+# pressure tensor is the kspace virial alone; compare against
+# parity_direct.py on the dumped geometry.
+#
+# Run from this directory (plugin defaults to ../build/libsog_lmp.so):
+#   lmp -in parity_direct.in -log parity_direct.log
+#   python parity_direct.py
+# Override paths:
+#   lmp -var plugin /abs/libsog_lmp.so -var dumpfile /tmp/parity.dump \
+#       -in parity_direct.in -log /tmp/parity_direct.log
+units metal
+atom_style charge
+boundary p p p
+lattice fcc 4.05
+region box block 0 2 0 2 0 2
+create_box 1 box
+create_atoms 1 box
+mass 1 22.99
+
+group pos id 1:31:2
+group neg id 2:32:2
+set group pos charge 1.0
+set group neg charge -1.0
+
+# Break the rocksalt inversion symmetry so forces are nonzero (every fcc
+# site is an inversion center -> exact zero force by symmetry otherwise).
+displace_atoms all random 0.15 0.15 0.15 12345
+
+pair_style zero 6.5
+pair_coeff * *
+
+variable plugin index ../build/libsog_lmp.so
+plugin load ${plugin}
+
+kspace_style sog amp 78.80229949951172 316.9695129394531 1267.8780517578125 5071.51220703125 20286.048828125 81144.1953125 324576.78125 1298307.125 5193228.5 20772914.0 83091656.0 332366624.0 bandwidth 9.097501754760742 36.39000701904297 145.56002807617188 582.2401123046875 2328.96044921875 9315.841796875 37263.3671875 149053.46875 596213.875 2384855.5 9539422.0 38157688.0 m 12 b 2.0 sigma 3.0162065545167596 spline cubes2_4 remove_self_interaction no direct yes 1.5708
+
+compute p all pressure NULL virial
+
+variable dumpfile index parity.dump
+dump d1 all custom 1 ${dumpfile} id type q x y z fx fy fz
+dump_modify d1 sort id format line "%d %d %.16g %.16g %.16g %.16g %.16g %.16g %.16g %.16g"
+
+thermo 1
+thermo_style custom step pe press c_p[1] c_p[2] c_p[3] c_p[4] c_p[5] c_p[6]
+thermo_modify format float %.16g
+run 0

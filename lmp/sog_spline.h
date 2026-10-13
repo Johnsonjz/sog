@@ -12,30 +12,30 @@
 
 namespace LAMMPS_NS {
 
-// ── B-spline weights (generalized to arbitrary order n) ──
-// Legacy fastsog compatibility — generalized Cox-de Boor for order 4/5/6.
-// Main sog.cpp uses sog_bspline_weights_1d_order() instead.
+// ── B-spline order (legacy fastsog, order 5 only) ──
+// For generalized B-spline (orders 4/5/6), see sog_bspline_weights_1d_order() in sog.cpp.
+// This fastsog copy uses std::array<double,5> for CUDA compatibility (sog_gpu.cu includes this header).
 
-inline void fastsog_bspline_weights_1d(const int n, const double frac,
-                                        std::vector<double> &w) {
-  w.resize(n);
-  std::fill(w.begin(), w.end(), 0.0);
+constexpr int kSog_BSplineOrder = 5;
+
+inline void fastsog_bspline_weights_1d(const double frac,
+                                        std::array<double, 5> &w) {
+  w.fill(0.0);
   w[0] = 1.0 - frac;
   w[1] = frac;
-  for (int k = 3; k <= n; ++k) {
+  for (int k = 3; k <= 5; ++k) {
     const double inv = 1.0 / static_cast<double>(k - 1);
-    std::vector<double> w_prev = w;
     w[static_cast<size_t>(k - 1)] =
-        frac * w_prev[static_cast<size_t>(k - 2)] * inv;
+        frac * w[static_cast<size_t>(k - 2)] * inv;
     for (int j = 1; j <= k - 2; ++j) {
       w[static_cast<size_t>(k - 1 - j)] =
           ((frac + static_cast<double>(j)) *
-               w_prev[static_cast<size_t>(k - 2 - j)] +
+               w[static_cast<size_t>(k - 2 - j)] +
            (static_cast<double>(k - j) - frac) *
-               w_prev[static_cast<size_t>(k - 1 - j)]) *
+               w[static_cast<size_t>(k - 1 - j)]) *
           inv;
     }
-    w[0] = (1.0 - frac) * w_prev[0] * inv;
+    w[0] = (1.0 - frac) * w[0] * inv;
   }
 }
 
@@ -88,6 +88,69 @@ inline double cubes2_R(const double theta, const double xi) {
          + (3.0 * xi * xi - 1.0) / 6.0 * theta;
 }
 
+// Value and derivatives with respect to the cell coordinates (tx,ty,tz).
+// Keeping the arithmetic in this small forward-mode type makes the derivative
+// implementation follow the weight formulas below exactly.
+struct CubeS2WeightGrad {
+  double value;
+  double d[3];
+};
+
+inline CubeS2WeightGrad cubes2_constant(const double value) {
+  return {value, {0.0, 0.0, 0.0}};
+}
+
+inline CubeS2WeightGrad cubes2_coordinate(const double value, const int axis,
+                                           const bool reflected = false) {
+  CubeS2WeightGrad out = cubes2_constant(value);
+  out.d[axis] = reflected ? -1.0 : 1.0;
+  return out;
+}
+
+inline CubeS2WeightGrad operator+(const CubeS2WeightGrad &a,
+                                   const CubeS2WeightGrad &b) {
+  return {a.value + b.value,
+          {a.d[0] + b.d[0], a.d[1] + b.d[1], a.d[2] + b.d[2]}};
+}
+
+inline CubeS2WeightGrad operator-(const CubeS2WeightGrad &a,
+                                   const CubeS2WeightGrad &b) {
+  return {a.value - b.value,
+          {a.d[0] - b.d[0], a.d[1] - b.d[1], a.d[2] - b.d[2]}};
+}
+
+inline CubeS2WeightGrad operator-(const CubeS2WeightGrad &a) {
+  return {-a.value, {-a.d[0], -a.d[1], -a.d[2]}};
+}
+
+inline CubeS2WeightGrad operator*(const CubeS2WeightGrad &a,
+                                   const CubeS2WeightGrad &b) {
+  return {a.value * b.value,
+          {a.d[0] * b.value + a.value * b.d[0],
+           a.d[1] * b.value + a.value * b.d[1],
+           a.d[2] * b.value + a.value * b.d[2]}};
+}
+
+inline CubeS2WeightGrad operator*(const double a,
+                                   const CubeS2WeightGrad &b) {
+  return {a * b.value, {a * b.d[0], a * b.d[1], a * b.d[2]}};
+}
+
+inline CubeS2WeightGrad cubes2_L(const CubeS2WeightGrad &theta,
+                                  const double xi) {
+  const auto t2 = theta * theta;
+  const auto t3 = t2 * theta;
+  return -0.5 * t3 + 0.5 * t2
+         + (-(9.0 * xi * xi - 2.0) / 6.0) * theta
+         + cubes2_constant(0.5 * xi * xi);
+}
+
+inline CubeS2WeightGrad cubes2_R(const CubeS2WeightGrad &theta,
+                                  const double xi) {
+  return (1.0 / 6.0) * (theta * theta * theta)
+         + ((3.0 * xi * xi - 1.0) / 6.0) * theta;
+}
+
 // Compute CubeS₂ 4th-order weight for a single node at fractional (tx,ty,tz)
 inline double cubes2_weight_4(const double tx, const double ty, const double tz,
                                const CubeS2Node4 &node, const double xi) {
@@ -119,6 +182,32 @@ inline double cubes2_weight_4(const double tx, const double ty, const double tz,
     }
     return cubes2_R(eta_special, xi) * eta_n1 * eta_n2;
   }
+}
+
+inline CubeS2WeightGrad cubes2_weight_grad_4(
+    const double tx, const double ty, const double tz,
+    const CubeS2Node4 &node, const double xi) {
+  const CubeS2WeightGrad coords[3] = {
+      cubes2_coordinate(tx, 0), cubes2_coordinate(ty, 1),
+      cubes2_coordinate(tz, 2)};
+  const int offs[3] = {node.dx, node.dy, node.dz};
+  auto eta_pos = [&](const int axis) {
+    return (offs[axis] == 1)
+        ? coords[axis]
+        : cubes2_coordinate(1.0 - coords[axis].value, axis, true);
+  };
+  if (node.cls == 0) {
+    const auto ex = eta_pos(0), ey = eta_pos(1), ez = eta_pos(2);
+    return cubes2_L(ex, xi) * ey * ez + cubes2_L(ey, xi) * ex * ez
+           + cubes2_L(ez, xi) * ex * ey;
+  }
+  const int sp = node.sp_axis;
+  const auto es = node.sp_is_neg
+      ? cubes2_coordinate(1.0 - coords[sp].value, sp, true)
+      : coords[sp];
+  int n1 = (sp + 1) % 3, n2 = (sp + 2) % 3;
+  if (n1 > n2) { const int t = n1; n1 = n2; n2 = t; }
+  return cubes2_R(es, xi) * eta_pos(n1) * eta_pos(n2);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -186,6 +275,38 @@ inline double cubes2_S_6(const double t, const double xi) {
          - (3.0 * xi * xi - 2.0) / 2.0 * t + 0.5 * xi * xi;
 }
 
+inline CubeS2WeightGrad cubes2_L111_6(const CubeS2WeightGrad &t,
+                                       const double xi) {
+  const double x2 = xi * xi, x4 = x2 * x2;
+  const auto t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+  return (1.0 / 12.0) * t5 - (1.0 / 6.0) * t4
+         + ((10.0 * x2 - 1.0) / 12.0) * t3
+         - ((6.0 * x2 - 1.0) / 6.0) * t2
+         + ((5.0 * x4 - x2) / 4.0) * t
+         + cubes2_constant(-(3.0 * x4 - x2) / 6.0);
+}
+
+inline CubeS2WeightGrad cubes2_L311_6(const CubeS2WeightGrad &t,
+                                       const double xi) {
+  const double x2 = xi * xi, x4 = x2 * x2;
+  const auto t3 = t * t * t, t5 = t3 * t * t;
+  return (1.0 / 120.0) * t5 + ((2.0 * x2 - 1.0) / 24.0) * t3
+         + ((15.0 * x4 - 15.0 * x2 + 4.0) / 120.0) * t;
+}
+
+inline CubeS2WeightGrad cubes2_L211_6(const CubeS2WeightGrad &t,
+                                       const double xi) {
+  return -0.25 * cubes2_L111_6(t, xi) - 2.5 * cubes2_L311_6(t, xi);
+}
+
+inline CubeS2WeightGrad cubes2_S_6(const CubeS2WeightGrad &t,
+                                    const double xi) {
+  const auto t2 = t * t, t3 = t2 * t;
+  return -0.5 * t3 + 0.5 * t2
+         + (-(3.0 * xi * xi - 2.0) / 2.0) * t
+         + cubes2_constant(0.5 * xi * xi);
+}
+
 // Compute CubeS₂ 6th-order weight for a single node at fractional (tx,ty,tz).
 inline double cubes2_weight_6(const double tx, const double ty, const double tz,
                               const CubeS2Node4 &node, const double xi) {
@@ -228,6 +349,57 @@ inline double cubes2_weight_6(const double tx, const double ty, const double tz,
     const double ez = (node.sp_is_neg & 4) ? (1.0 - tz) : tz;
     return cubes2_R(ex, xi) * cubes2_R(ey, xi) * cubes2_R(ez, xi);
   }
+}
+
+inline CubeS2WeightGrad cubes2_weight_grad_6(
+    const double tx, const double ty, const double tz,
+    const CubeS2Node4 &node, const double xi) {
+  const CubeS2WeightGrad coords[3] = {
+      cubes2_coordinate(tx, 0), cubes2_coordinate(ty, 1),
+      cubes2_coordinate(tz, 2)};
+  const int offs[3] = {node.dx, node.dy, node.dz};
+  auto eta_pos = [&](const int axis) {
+    return (offs[axis] == 1)
+        ? coords[axis]
+        : cubes2_coordinate(1.0 - coords[axis].value, axis, true);
+  };
+  if (node.cls == 0) {
+    const auto ex = eta_pos(0), ey = eta_pos(1), ez = eta_pos(2);
+    return cubes2_L111_6(ex, xi) * ey * ez
+         + cubes2_L111_6(ey, xi) * ez * ex
+         + cubes2_L111_6(ez, xi) * ex * ey
+         + cubes2_S_6(ex, xi) * cubes2_S_6(ey, xi) * cubes2_S_6(ez, xi);
+  }
+  if (node.cls == 1 || node.cls == 2) {
+    const int sp = node.sp_axis;
+    const auto es = node.sp_is_neg
+        ? cubes2_coordinate(1.0 - coords[sp].value, sp, true)
+        : coords[sp];
+    int n1 = (sp + 1) % 3, n2 = (sp + 2) % 3;
+    if (n1 > n2) { const int t = n1; n1 = n2; n2 = t; }
+    if (node.cls == 1)
+      return cubes2_L211_6(es, xi) * eta_pos(n1) * eta_pos(n2)
+           + cubes2_R(es, xi) * cubes2_S_6(eta_pos(n1), xi)
+                             * cubes2_S_6(eta_pos(n2), xi);
+    return cubes2_L311_6(es, xi) * eta_pos(n1) * eta_pos(n2);
+  }
+  if (node.cls == 3) {
+    const int nm = node.sp_axis;
+    int s1 = (nm + 1) % 3, s2 = (nm + 2) % 3;
+    if (s1 > s2) { const int t = s1; s1 = s2; s2 = t; }
+    const auto es1 = (node.sp_is_neg & 1)
+        ? cubes2_coordinate(1.0 - coords[s1].value, s1, true) : coords[s1];
+    const auto es2 = (node.sp_is_neg & 2)
+        ? cubes2_coordinate(1.0 - coords[s2].value, s2, true) : coords[s2];
+    return cubes2_S_6(eta_pos(nm), xi) * cubes2_R(es1, xi) * cubes2_R(es2, xi);
+  }
+  const auto ex = (node.sp_is_neg & 1)
+      ? cubes2_coordinate(1.0 - tx, 0, true) : coords[0];
+  const auto ey = (node.sp_is_neg & 2)
+      ? cubes2_coordinate(1.0 - ty, 1, true) : coords[1];
+  const auto ez = (node.sp_is_neg & 4)
+      ? cubes2_coordinate(1.0 - tz, 2, true) : coords[2];
+  return cubes2_R(ex, xi) * cubes2_R(ey, xi) * cubes2_R(ez, xi);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -301,6 +473,23 @@ inline double quads_weight_1d(double t, int off, double xi, int order) {
 inline void quads_weights_1d(double t, double xi, int order, double *w) {
   const int *offs = quads_offsets(order);
   for (int k = 0; k < order; ++k) w[k] = quads_weight_1d(t, offs[k], xi, order);
+}
+
+inline void quads_weights_derivs_1d(double t, double xi, int order,
+                                     double *w, double *dw) {
+  const int *offs = quads_offsets(order);
+  for (int k = 0; k < order; ++k) {
+    double c[6];
+    quads_offset_coeffs(offs[k], xi, order, c);
+    double value = c[order - 1];
+    double deriv = 0.0;
+    for (int p = order - 2; p >= 0; --p) {
+      deriv = deriv * t + value;
+      value = value * t + c[p];
+    }
+    w[k] = value;
+    dw[k] = deriv;
+  }
 }
 
 // I_p(α)=∫₀¹ tᵖ e^{iαt}dt, p=0..pmax (recurrence; Taylor for small |α|).
