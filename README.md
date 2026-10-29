@@ -132,25 +132,11 @@ $$
 kfac = \sum_m amp^{\text{internal}}_m\,\exp\left(-\tfrac{1}{2}bw^2_m k^2\right)
 $$
 
-`Sog` accepts two concise mode keys to describe how your input tensors are interpreted:
-
-- `kernel_param_mode`: how `amp` and `bandwidth` are interpreted
-    - `"raw"` (default): input `amp` is raw coefficient and input `bandwidth` is $bw$.
-        The library converts internally to $(amp \cdot bw^2, bw^2)$.
-    - `"internal"`: input `amp` is already internal amplitude and input `bandwidth` is already $bw^2$.
-- `kernel_tensor_mode`: how Gaussian kernel tensors are owned/bound
-    - `"owned"` (default): Gaussian owns `nn.Parameter` tensors.
-    - `"external"`: Gaussian directly uses caller tensors (useful when gradients must flow to upstream parameters).
-    - `"auto"`: choose external binding when `trainable_kernel=False` and differentiable tensor inputs are detected.
-
-### Backward compatibility
-
-Older bool-style keys are still accepted and mapped internally:
-
-- `amp_is_internal` + `bandwidth_is_squared` -> `kernel_param_mode`
-- `use_external_kernel_tensors` -> `kernel_tensor_mode`
-
-Prefer the new mode keys for clarity.
+`Sog` takes two mode keys — `kernel_param_mode` (`"raw"`/`"internal"`: is
+`bandwidth` un-squared or already `bw²`?) and `kernel_tensor_mode`
+(`"owned"`/`"external"`/`"auto"`: who owns the kernel tensors?).  Defaults are
+`"raw"` + `"owned"`; legacy bool keys are mapped automatically.  Full semantics:
+[`docs/02`](docs/02-python-api.md).
 
 ## Install
 

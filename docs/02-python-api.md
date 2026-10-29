@@ -65,13 +65,25 @@ k.init_from_rcut(6.0, nlayers=2)               # regenerate from a cutoff
 | `to_lammps_dict()` / `to_lammps_tokens()` / `to_lammps_input()` | coupling #4 (see 04) |
 | `to_state_dict()` / `from_state_dict()` | versioned round-trip (`_bw_format_version`) |
 
-Two tensor modes, reusing the existing semantics:
+Two mode keys describe how input tensors are interpreted (this section is the
+full reference):
 
-- `owned` (default): kernel creates `nn.Parameter`s — pre-square bandwidth
-  (`_bandwidth_is_squared=False`), the negativity-safe choice.
-- `external`: binds caller tensors; `bandwidth_sq()` squares unless
-  `bandwidth_is_squared=True`. Nothing is registered, so no duplicate
-  `state_dict` keys.
+- `kernel_param_mode` — how `amp`/`bandwidth` are interpreted:
+  - `"raw"` (default): `amp` is the raw coefficient and `bandwidth` is `bw`
+    (un-squared); the library converts internally to `(amp·bw², bw²)`.
+  - `"internal"`: `amp` is already the internal amplitude and `bandwidth` is
+    already `bw²`.
+- `kernel_tensor_mode` — how the kernel tensors are owned/bound:
+  - `"owned"` (default): creates `nn.Parameter`s (pre-square bandwidth — the
+    negativity-safe choice).
+  - `"external"`: binds caller tensors by reference (gradients reach them);
+    `bandwidth_sq()` squares unless `bandwidth_is_squared=True`. Nothing is
+    registered, so no duplicate `state_dict` keys.
+  - `"auto"`: chooses `external` when `trainable_kernel=False` and the inputs
+    are differentiable tensors, else `owned`.
+
+Legacy bool keys (`amp_is_internal`, `bandwidth_is_squared`,
+`use_external_kernel_tensors`) are mapped to these internally.
 
 Composition with `Gaussian` needs no changes to `Gaussian`: `Sog` builds it in
 external mode with `trainable=False`.

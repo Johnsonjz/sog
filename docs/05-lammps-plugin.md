@@ -13,25 +13,11 @@ page is the integration view: what a port must know and in what order.
 
 ## Build
 
-```bash
-cmake -S sog/lmp -B build \
-  -DLAMMPS_SOURCE_ROOT=/path/to/lammps \        # headers matching the target binary
-  -DSOG_GLIBCXX_OLD_ABI=ON \                    # match the target's ABI
-  -DFFT=KISS \                                  # match the target's FFT
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j                          # → build/libsog_lmp.so
-```
-
-| Knob | Match it to the LAMMPS binary that will load the plugin |
-|---|---|
-| `SOG_GLIBCXX_OLD_ABI` | `ON` iff the binary uses the old libstdc++ ABI (`-D_GLIBCXX_USE_CXX11_ABI=0`). Symptom of mismatch: `undefined symbol ...Ss...` at `plugin load`. |
-| `FFT` | `KISS` (in-binary kissfft, links nothing), `FFTW3`, `MKL` |
-| `SOG_WITH_DEEPMD` | `ON` only for this fork's deepmd-kit (charge-response C++-API extensions) |
-| `SOG_WITH_GPU` | `ON` compiles the raw-CUDA kspace; otherwise a CPU stub aborts clearly on `use_gpu yes` |
-
-MPI is headers-only: the plugin resolves MPI symbols from the host binary and
-never links its own MPI (falls back to LAMMPS' serial `STUBS` when no MPI dev
-install exists).
+Build the plugin from `lmp/`; every knob (ABI, FFT, DeepMD/GPU), the
+`undefined symbol ...Ss...` mismatch symptom and the MPI headers-only note are
+in [`../lmp/README.md`](../lmp/README.md) §Build.  One fact specific to the
+integration view: the standalone **in-graph op** (`op/`) links libtorch and must
+**not** set `SOG_GLIBCXX_OLD_ABI` — that flag is for the LAMMPS plugin only.
 
 ## Minimal input (fixed charges, no latent charges)
 
@@ -39,8 +25,8 @@ install exists).
 plugin load /path/to/libsog_lmp.so
 pair_style lj/cut/coul/long 6.5      # any pair style that writes atom->q
 pair_coeff * * 0.1 2.4
-kspace_style sog amp <M> bandwidth <M²> m 12 b 2.0 sigma 3.016 \
-    spline cubes2_4 remove_self_interaction yes phi_max 0.23
+kspace_style sog amp <M> bandwidth <M²> spline cubes2_4 \
+    remove_self_interaction yes phi_max 0.23 m 12
 run 0
 ```
 
@@ -53,8 +39,8 @@ response term vanishes. (If you add the fix anyway in a native build, the
 ```lammps
 plugin load /path/to/libsog_lmp.so
 pair_style deepmd model.pth latent_charge_to_q yes
-kspace_style sog amp <M> bandwidth <M²> m 12 spline cubes2_4 \
-    remove_self_interaction yes phi_max 0.23
+kspace_style sog amp <M> bandwidth <M²> spline cubes2_4 \
+    remove_self_interaction yes phi_max 0.23 m 12
 fix sresp all sog/response model model.pth          # coupling #3
 ```
 

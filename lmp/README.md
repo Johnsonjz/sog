@@ -172,11 +172,10 @@ class SogChargeSource {
 };
 ```
 
-Resolution order in `SOGKSpace::compute()`: (1) a source registered via
-`SOGKSpace::set_charge_source()`; (2) the deepmd adapter (if compiled in);
-(3) `atom->q` — which **any** pair style that writes charges satisfies. The
-deepmd adapter guards against `dcharge_multi` being empty (model with
-`latent_charge_to_q` off), falling back to channel 1.
+Resolution order in `SOGKSpace::compute()`: `set_charge_source()` → the DeepMD
+adapter (if compiled) → `atom->q` (any pair that writes charges). The DeepMD
+adapter falls back to channel 1 when `dcharge_multi` is empty. Details in
+[`../docs/06-cpp-porting.md`](../docs/06-cpp-porting.md).
 
 Coupling #3 — what SOG **asks back** (`sog_charge_response.h`):
 
@@ -200,12 +199,10 @@ keeps every LAMMPS-native duty: locating `kspace_style sog`, enabling
 accumulation, and `v_tally` of the 9-component virial.
 
 For DeepMD, `∂q/∂r` and `∂q/∂h` come from Torch via VJP on the pair's retained
-forward graph (`compute_charge_response_cached`), with a standalone
-forward+backward fallback. The fallback's `deepmd::InputNlist` is assembled by
-`FixSOGResponse::build_input_nlist` — the only context that is a friend of
-`CommBrickDeepMD` (whose protected comm layout the nlist needs), because
-deepmd-kit must not be modified. A new framework supplies its own
-`SogChargeResponse` adapter; see `docs/06-cpp-porting.md`.
+forward graph (`compute_charge_response_cached`), with a forward+backward
+fallback. A new framework supplies its own `SogChargeResponse` adapter; the
+DeepMD-specific VJP plumbing (`build_input_nlist`, `CommBrickDeepMD`) is in
+[`../docs/06-cpp-porting.md`](../docs/06-cpp-porting.md).
 
 ## Known limits
 
