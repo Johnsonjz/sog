@@ -17,12 +17,15 @@ representative config, then invert the law for a target relative accuracy eps:
         phi_max = (eps / C_nu)^(1/p_nu) * sigma_min / r_c ,   clamped below the validity ceiling
         phi_valid = sigma_min / (sqrt(2) * xi0) / r_c        (on-grid variance sigma_k^2 > 0).
 
-The closed-form default (phi_max()/FALLBACK_LAW) is now calibrated on FORCE-rel by direct bisection
-(calibrate_phi_max_anchors.py): at eps=1e-4 the cons order-6 kernel gives phi~0.068 (NOT 0.10 -- the
-old 0.10 anchor was a back-fit; phi=0.10 is really force-rel ~2e-3). calibrate()/phi_max_for_kernel()
-below still self-calibrate a per-kernel ENERGY-rel law (a looser, cancellation-prone metric; prefer the
-force-rel FALLBACK_LAW for grid sizing). The paper's 0.23/0.065 (order-4) and 0.35/0.16 (order-6) are
-the two u-series intrinsic-error tiers (b=2 C1 ~1/r_c^2 ; b~1.63 C2 ~1/r_c^3).
+The closed-form default (phi_max()/FALLBACK_LAW) uses the PAPER's reference force-rel coefficients
+(CubeS₂ order-4 C=1.0e-1, order-6 C=2.4e-2; sog-lib-paper eq:phimax-rule / tab:spline-slopes),
+adopted as the production reference so this module, the C++ auto-derive (sog.cpp) and the in-graph
+op (sog_green.h) all size the grid identically. At eps=1e-4 the cons kernel gives phi~0.027
+(order-4) / ~0.060 (order-6). calibrate()/phi_max_for_kernel() below still self-calibrate a
+per-kernel FORCE-rel law (C_nu is kernel/system-dependent, ~40% spread across the audited kernels);
+prefer the reference FALLBACK_LAW unless you have measured your own kernel. The paper's
+0.23/0.065 (order-4) and 0.35/0.16 (order-6) are the two u-series intrinsic-error tiers
+(b=2 C1 ~1/r_c^2 ; b~1.63 C2 ~1/r_c^3).
 CPU-only. Depends on the sog Python package (verify_phi_max helpers)."""
 import sys, math
 import numpy as np
@@ -42,17 +45,17 @@ XI0 = {4: 0.5773502691896258, 6: 0.6503998764035732}
 # window-influence division K/|Ŵ|² eliminates this term entirely — only bare charge-spreading
 # interpolation error remains, giving C_nu ~2×10⁻⁴ (100–500× smaller). The constants below are
 # calibrated from the python FFT ε-ladder sweep on random water-like systems (n_dl=0.5 reference):
-#   - CubeS₂  (Form B): pooled-median bisection (calibrate_phi_max_anchors.py)
+#   - CubeS₂  (Form B): the paper's reference coefficients (trained conservative water kernel,
+#     FORCE-rel metric; C_nu is kernel/system-dependent, ~40% spread)
 #   - QuadS   (Form A): upper-bound from measured F_rel ≤ 1×10⁻⁴ at all grids (Δ/σ_min ≤ 0.95);
 #     true C likely smaller but our n_dl=0.5 reference cannot resolve below ~9×10⁻⁵.
 #
 # Force-rel is canonical: it is what MD is driven by, it matches the C++ auto-derive (sog.cpp), and it
 # is the metric where the single-parameter (Delta/sigma_min) law collapses (CV ~5% across kernels;
-# energy-rel scatters 15-30% and floors out).  The old back-fit (p ~3.96/6.53, C tuned to reproduce
-# phi=0.10 at eps=1e-4) was optimistic ~30x in force-rel; the true force-rel at phi=0.10 (order-6 cons)
-# is ~2e-3.  With honest p=2nu, the median-refit C gives phi(eps=1e-4) = 0.032 (order-4) / 0.066
-# (order-6) on the cons kernel (sigma_min=0.750 A).  Refit date: 2026-07-13; split date: 2026-07-22.
-CUBES2_LAW = {4: {"p": 4, "C": 4.953e-2}, 6: {"p": 6, "C": 1.377e-2}}
+# energy-rel scatters 15-30% and floors out).  With p=2nu the reference coefficients give
+# phi(eps=1e-4) = 0.027 (order-4) / 0.060 (order-6) on the cons kernel (sigma_min=0.750 A).
+# Coefficients adopted from deepmd-kit-LR @ a266642d2 (paper reference values).
+CUBES2_LAW = {4: {"p": 4, "C": 1.0e-1}, 6: {"p": 6, "C": 2.4e-2}}
 QUADS_LAW  = {4: {"p": 4, "C": 2.0e-4},  6: {"p": 6, "C": 2.0e-4}}
 # Legacy alias — kept for backward compatibility; new code should use the spline-specific dicts.
 FALLBACK_LAW = CUBES2_LAW

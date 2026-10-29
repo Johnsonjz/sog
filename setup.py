@@ -14,6 +14,13 @@ setup(
         # "cufinufft @ git+https://github.com/Johnsonjz/finufft.git@feature/cufinufft-simple-plan-cache#subdirectory=python/cufinufft",
         "pytorch_finufft",
     ],
+    extras_require={
+        # The isolated PyTorch-2.x deployment layer (sog.v2).
+        # torch>=2.5 provides make_fx symbolic tracing + torch.library.register_autograd.
+        "v2": ["torch>=2.5"],
+        # AOTInductor .pt2 packaging (aoti_compile_and_package) landed after 2.5.
+        "v2-aoti": ["torch>=2.6"],
+    },
     author="SOG contributors",
     description="Gaussian long-range SOG plugin",
     long_description=open("README.md", encoding="utf-8").read(),

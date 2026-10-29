@@ -132,3 +132,36 @@ Regression history:
 | Before the refactor | 26 passed, 7 failed (stale call signatures), 2 script-style files not collectable (the `phi_max` pair) |
 | After the repairs | 7 stale failures repaired; new tests added (kernel/export/forward/validation); the `phi_max` pair converted to real pytest tests (calibration + held-out) |
 | Note | `test_deepmd_alignment` *skips*: the deepmd reference bridge is stale against this deepmd-kit (`SOGEnergyModel._compute_sog_frame_correction_bundle` does not exist) — a bridge gap, not a SOG regression |
+
+## 7. The `sog.v2` deployment layer
+
+New tests live in `test/v2/` (markers `v2`, `torch_op`, `cuda`, `aoti`):
+
+| File | Check |
+|---|---|
+| `test_import_isolated.py` | `import sog` does not import `sog.v2`; `sog.v2` imports without CUDA/op; legacy API intact |
+| `test_exportable_kernel.py` | analytic `v/F/vir6` equal autograd (≤1e-10); `E = ½Σvq`; batch invariance; `make_fx`-traceable |
+| `test_external_kspace_algebra.py` | energy identity, seed semantics, vir6 mappings, global-mean neutralization + ghost zeroing, `eager_efv` vs FD |
+| `test_kspace_op.py` | schema, grid equals the φ_max rule, op vs Python CubeS₂ + direct reference, fp32/triclinic rejected |
+| `test_neutralize_vjp.py` | exact VJP equals explicit autograd; ghost rows zero; idempotent registration |
+| `test_export_pipeline.py` | full-LR trace/export, Mode-A artifacts, metadata/zip layout, AOTI compile+load |
+
+Measured on the 64-atom/12 Å fixture: op vs Python CubeS₂ energy identical
+(1e-16), force ≈ 3–5e-4 relative, virial ≈ 1e-4 relative (mesh
+discretization); op vs the static direct reference agrees at the same level.
+The AOTI smoke compiles with `gcc-toolset-13` and matches eager to 1e-8.
+
+**Known issue found while validating:** the legacy `Gaussian` CubeS₂ autograd
+virial does not include the self-interaction strain term (toggling
+`remove_self_interaction` leaves it unchanged).  The deployed C++ mesh and the
+in-graph op use the complete `W_ks + W_self` form; the `sog.v2` reference
+implements the same complete form and was verified against autograd to 1e-12.
+Use the reference/op for virial comparisons, not the legacy autograd path.
+
+Run the deployment tests explicitly:
+
+```bash
+pytest test/v2 -q                       # skips op/AOTI when unavailable
+SOG_KS_OP_LIB=/path/libsog_kspace_op.so pytest -m torch_op
+PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH pytest -m aoti
+```

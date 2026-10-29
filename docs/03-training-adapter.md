@@ -130,3 +130,13 @@ from 02.
       `SogKernel(r_cut=...).amp_internal()/bandwidth_sq()` bit-for-bit
       (see `test/test_sog_kernel.py::test_kernel_matches_gaussian_rcut_convention`).
 - [ ] Export step works and matches the C++ side (04).
+
+## Deployment mode: external k-space (optional)
+
+If the model is deployed with the solver outside the training graph, use
+[`sog.v2.external_kspace.ExternalKSpace`](09-in-graph-kspace.md) and inject its
+fused seed into the differentiated energy.  The seed algebra — inject
+`sum(v·q)` **not** `½ sum(v·q)`, divide by the **owned** count, use the complete
+`vir6` — is specified once in [09-in-graph-kspace.md](09-in-graph-kspace.md)
+(share semantics), with the symptom → cause table in
+[10-export-and-artifacts.md](10-export-and-artifacts.md).

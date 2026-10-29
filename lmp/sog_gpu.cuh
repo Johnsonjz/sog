@@ -34,5 +34,52 @@ double sog_gpu_compute(SogGpuState *s, int nlocal,
                        int spline, int want_potential,
                        double *force, double *virial6, double *vpot,
                        double self_coeff, double qsqsum, int remove_self);
+
+// Device-resident variant: x, q, force and vpot are device pointers (Kokkos
+// views). Only the energy/virial reductions return to the host.
+double sog_gpu_compute_dev(SogGpuState *s, int nlocal,
+                           const double *d_x, const double *boxlo,
+                           double lx, double ly, double lz,
+                           const double *d_q, double qscale,
+                           int spline, int want_potential,
+                           double *d_force, double *virial6, double *d_vpot,
+                           double self_coeff, double qsqsum, int remove_self);
+
+// Multi-rank replicated-grid path (see sog_gpu.cu). The density mesh is the
+// summed global grid; each rank then runs the device FFT/green/gather itself.
+void sog_gpu_spread_full_dev(SogGpuState *s, int nlocal, const double *d_x,
+                             const double *boxlo, double lx, double ly,
+                             double lz, const double *d_q, double rho_scale,
+                             int spline);
+double *sog_gpu_rho_device_ptr(SogGpuState *s);  // for CUDA-aware MPI
+void sog_gpu_rho_download(SogGpuState *s, double *host);
+void sog_gpu_rho_upload(SogGpuState *s, const double *host);
+double sog_gpu_solve_dev(SogGpuState *s, int nlocal, const double *d_x,
+                         const double *boxlo, double lx, double ly, double lz,
+                         const double *d_q, double qscale, int spline,
+                         int want_pot, double *d_force, double *virial6,
+                         double *d_vpot, double self_coeff, double qsqsum,
+                         int remove_self);
+
+// Local brick operations used by the PPPM-style distributed backend.  Grid
+// indices are global and may extend below zero or above N-1 in the ghost
+// layers.  The host owns Grid3d communication and the distributed FFT; CUDA
+// performs only particle-local spreading and adjoint gathering.
+void sog_gpu_spread_brick(SogGpuState *s, int nlocal,
+                          const double *x, const double *boxlo,
+                          double lx, double ly, double lz,
+                          const double *q, double rho_scale, int spline,
+                          int nx, int ny, int nz,
+                          int nxlo, int nxhi, int nylo, int nyhi,
+                          int nzlo, int nzhi, double *rho_brick);
+
+void sog_gpu_gather_brick(SogGpuState *s, int nlocal,
+                          const double *x, const double *boxlo,
+                          double lx, double ly, double lz,
+                          const double *q, double qscale, int spline,
+                          int nx, int ny, int nz,
+                          int nxlo, int nxhi, int nylo, int nyhi,
+                          int nzlo, int nzhi, const double *u_brick,
+                          double *force, double *vpot);
 }
 #endif  // SOG_GPU_CUH

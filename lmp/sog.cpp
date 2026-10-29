@@ -942,26 +942,26 @@ void SOGKSpace::ensure_fft_plan() {
       // MEASURED grid-error law  rel ≈ C_ν·(Δ/σ_min)^{p_ν}  for a target relative accuracy ε:
       //     φ_max = (ε/C_ν)^{1/p_ν} · σ_min/r_c ,   clamped below the validity ceiling
       //     Δ_max = σ_min/(√2·ξ₀).
-      // (C_ν, p_ν) are calibrated OFFLINE by the Python direct-k-sum tools
-      // (sog/phi_max_rule.py, verify_anchors.py, refine_phi_max_constants.py) on a representative
-      // water kernel — C_ν is kernel/system-dependent (~100× spread), so the precise per-kernel
-      // value comes from those tools; the constants below are the cons/water FORCE-rel calibration,
-      // with each φ_max point pinned by BISECTION on the true FFT-vs-direct curve (no fit scatter).
+      // (C_ν, p_ν) are the reference coefficients of the paper's spacing rule
+      // (sog-lib-paper eq:phimax-rule / tab:spline-slopes), measured on the trained
+      // conservative water kernel with the FORCE-relative metric.  C_ν is
+      // kernel/system-dependent (~40% spread across the audited kernels); the Python
+      // tools (sog/phi_max_rule.py, calibrate_phi_max_anchors.py) can re-measure it.
       // ε is a target FORCE-rel accuracy; default 1e-4 gives a genuine 1e-4-force-rel grid
-      // (order-6 φ=0.068, order-4 φ=0.032 on cons); override with the `phi_accuracy` keyword. bandwidth is
-      // always populated by finalize_kernel_parameters (init), so σ_min = √β_min is available.
+      // (order-6 φ=0.060, order-4 φ=0.027 on cons); override with the `phi_accuracy` keyword.
+      // bandwidth is always populated by finalize_kernel_parameters (init), so
+      // σ_min = √β_min is available.
       double bw_min = bandwidth.empty() ? sigma_param * sigma_param : bandwidth[0];
       for (double bw : bandwidth)
         if (bw < bw_min) bw_min = bw;
       const double sigma_min = std::sqrt(bw_min);
       // (C_ν, p_ν) = THEORY-ENFORCED force-rel error law: p_nu = 2*nu from Proposition 5;
-      // C_nu = per-spline-family force-rel prefactor (CubeS₂=Form B variance-subtraction,
-      // QuadS=Form A exact window division, ~100× smaller C).  Calibrated by bisection
-      // (calibrate_phi_max_anchors.py) + ε-ladder sweep on random water-like systems
-      // (precision_sweep_py.py).  See phi_max_rule.py::CUBES2_LAW / QUADS_LAW.
-      // With honest p=2ν, ε=1e-4 → φ=0.032 (order-4) / 0.066 (order-6) on the cons kernel
-      // for CubeS₂; QuadS can use coarser grids at the same accuracy target.
-      // PRODUCTION pins explicit phi_max=0.10 (force-rel ~2e-3, validated adequate).
+      // C_nu = per-spline-family force-rel prefactor.  CubeS₂ (Form B variance subtraction)
+      // uses the paper's reference coefficients (sog-lib-paper eq:phimax-rule /
+      // tab:spline-slopes, trained conservative water kernel, FORCE-rel metric):
+      //   C_4 = 1.0e-1, C_6 = 2.4e-2.  Must stay identical to the in-graph op's
+      //   sog_green.h so both chains size the grid the same way.
+      // QuadS (Form A exact window division) can use coarser grids at the same target.
       double C_nu, p_nu;
       if (is_quads) {
         // Form A (exact window division): only charge-spreading error remains.
@@ -970,8 +970,8 @@ void SOGKSpace::ensure_fft_plan() {
         C_nu = (spline_type == 6) ? 2.0e-4 : 2.0e-4;
         p_nu = (spline_type == 6) ? 6.0 : 4.0;
       } else {
-        // Form B (variance subtraction): pooled-median bisection constants.
-        C_nu = (spline_type == 6) ? 1.377e-2 : 4.953e-2;
+        // Form B (variance subtraction): the paper's reference coefficients.
+        C_nu = (spline_type == 6) ? 2.4e-2 : 1.0e-1;
         p_nu = (spline_type == 6) ? 6.0 : 4.0;
       }
       const double eps_default = 1.0e-4;                            // canonical target force-rel accuracy

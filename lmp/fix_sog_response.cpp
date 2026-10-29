@@ -88,6 +88,9 @@ FixSOGResponse::FixSOGResponse(LAMMPS *lmp, int narg, char **arg)
   comm_reverse = 3;  // dfcorr_buff: 3 doubles per atom
   virial_global_flag = 1;
   energy_global_flag = 1;
+  // Without ``thermo_virial`` LAMMPS does not fold this fix's virial into the
+  // thermo pressure (the deployed deepmd fix sets it too).
+  thermo_virial = 1;
 }
 
 FixSOGResponse::~FixSOGResponse() { delete charge_response; }

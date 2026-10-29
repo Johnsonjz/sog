@@ -87,3 +87,13 @@ forces — see 08).
   pair; `g_ewald` is set only for pair-style compatibility.
 - Not restricted to DeepMD: after the abstraction, the only framework-named
   code is in `lmp/adapters/` behind `#ifdef SOG_WITH_DEEPMD`.
+
+## Deployment chains (PyTorch 2.x)
+
+For inference/export there are two equivalent chains: **Mode A** (2F+1B, solver
+in LAMMPS) and **Mode B** (1F+1B, solver in-graph).  The physics and the kernel
+parameters are identical — only the number of model passes and where the
+reciprocal solve lives change.  See [10](10-export-and-artifacts.md) (chains,
+artifacts) and [09](09-in-graph-kspace.md) (in-graph op).  `sog.v2` is an
+isolated subpackage: nothing here changes the legacy `Sog`/`Gaussian`
+behaviour.

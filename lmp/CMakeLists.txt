@@ -103,6 +103,12 @@ set(SOG_HEADERS
 
 if(SOG_WITH_GPU)
   enable_language(CUDA)
+  # sog_gpu.cu uses atomicAdd(double), which requires sm_60+; CMake's default
+  # architecture (sm_52) fails with "no instance of overloaded function".
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING
+        "CUDA architectures for sog_gpu.cu (>=60 for double atomicAdd)")
+  endif()
   list(APPEND SOG_SOURCES sog_gpu.cu)
   find_package(CUDAToolkit REQUIRED)
 else()

@@ -112,3 +112,15 @@ Analysis checklist (physics, not code):
 | plugin load + native run (fixed charges) | executed — `lmp/tests/native_smoke.in`, 2 steps clean |
 | export → LAMMPS direct k-sum → Python parity | executed — `lmp/tests/parity_direct.py` (numbers in 08) |
 | full DFT-data training + production MD | reference — `dp/dp_example/water/lmp/SOG_WORKFLOW.md` |
+
+## Stage 2b — deployment export (optional)
+
+- **Mode A** (pair + kspace + fix): export the Mode-A artifacts; LAMMPS keeps
+  `kspace_style sog` + `fix sog/response`.  No CUDA op needed.
+- **Mode B** (full-LR single graph): export the `full_lr` artifact; LAMMPS uses
+  `pair ... full_lr yes` + `kspace_style none`.  Faster (one model forward),
+  needs the in-graph op.
+
+Both use `sog.v2.export`.  Artifact names, ABIs, the AOTI configuration and the
+toolchain requirements are in
+[10-export-and-artifacts.md](10-export-and-artifacts.md).

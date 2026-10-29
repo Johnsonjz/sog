@@ -36,3 +36,4 @@ Markers are declared in `pytest.ini`:
 | φ_max grid rule (calibration, held-out verification) | `test_phi_max_rule.py`, `test_phi_max_verify.py`, `test_phi_convergence.py` |
 | DeepMD cross-checks | `test_deepmd_alignment.py`, `test_gaussian_external_kernel_tensors.py` |
 | LAMMPS plugin (skippable) | `test_lammps_plugin.py` (drives `lmp/tests/`) |
+| PyTorch-2.x deployment layer (`sog.v2`) | `test/v2/` — op, neutralization VJP, export/AOTI, algebra (see `docs/09`–`11`) |

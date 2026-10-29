@@ -114,3 +114,29 @@ from sog.integration import (
 | shape error in `build_mlp`/`Atomwise` | `n_hidden` must have `n_layers−1` entries |
 | BEC shape/index errors | `compute_bec` with `output_index` is broken (raises; see 08) — use the full BEC |
 | kernel not trainable | `kernel_tensor_mode="external"` with non-differentiable inputs |
+
+## `sog.v2` — the deployment layer
+
+`import sog` is unchanged.  The PyTorch-2.x deployment pieces live under
+`sog.v2` and are imported explicitly:
+
+```python
+from sog.v2 import kspace_op, ExternalKSpace, KSpaceSettings
+from sog.v2.exportable import TraceableSogKernel, ReferenceKSpace
+from sog.v2.export import (trace_with_make_fx, export_program, compile_artifact,
+                           build_metadata, install_artifacts)
+```
+
+| Object | What it is |
+|---|---|
+| `external_kspace.ExternalKSpace` | `q, pos, box → SogSolution(qn, v, F_dir, vir6)`; `backend="op"`, `"reference"`, or `"auto"` |
+| `external_kspace.SogSolution` | the three linear quantities; `energy()` = `½Σvq` |
+| `external_kspace.neutralize_reference` | pure-PyTorch gauge projection (traceable) |
+| `exportable.TraceableSogKernel` | static-grid direct k-sum with analytic v/F/virial (CPU/export fallback) |
+| `exportable.ReferenceKSpace` | the same call signature as `ExternalKSpace`, pure PyTorch |
+| `kspace_op.load_op_library` / `op_available` / `register_neutralize_autograd` | op loading + the exact gauge VJP |
+| `export.*` | trace/export/AOTI helpers and artifact metadata |
+
+Details: [09](09-in-graph-kspace.md) and [10](10-export-and-artifacts.md).
+`import sog.v2` never loads CUDA or the op library; `op_available()` tells you
+whether it is registered.

@@ -240,3 +240,16 @@ Auto-skips when no LAMMPS binary is configured; the inputs also run standalone
 - DeepMD worked example:
   `/data/home/public/jiangzhen/dp/dp_example/water/lmp/SOG_WORKFLOW.md`
 - Reference: Predescu, Bergdorf, Shaw, J. Chem. Phys. 153, 224117 (2020)
+
+## PyTorch deployment (separate from this plugin)
+
+The in-graph k-space op (`sogkspace::solve_auto`) and the `.pt2` artifacts are
+built from [`../op/`](../op/) and live in the isolated Python package
+`../src/sog/v2/`.  They are used by the single-graph chain
+(`pair ... full_lr yes` + `kspace_style none`), which does not load this
+plugin.  See [`../docs/09-in-graph-kspace.md`](../docs/09-in-graph-kspace.md)
+and [`../docs/10-export-and-artifacts.md`](../docs/10-export-and-artifacts.md).
+
+This plugin mirrors the active tree's shared sources; the vendored/patched
+list and the deliberately deferred features (`box_tol`, distributed mesh,
+`kspace sog/kk`, device response) are in [`SYNC_NOTE.md`](SYNC_NOTE.md).

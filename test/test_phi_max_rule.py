@@ -9,8 +9,8 @@ target accuracies eps. Checks:
       within a bounded factor of eps;
   (c) monotonicity: eps down -> phi down; order up -> phi up (accuracy-limited);
   (d) validity: phi_max stays below the ceiling sigma_min/(sqrt2 xi0)/r_c;
-  (e) production reproduction: cons order-4 eps~4e-3 -> phi~0.0675;
-      order-6 eps~1e-4 -> phi~0.10.
+  (e) reference law reproduction: cons order-4 eps=1e-4 -> phi~0.0267;
+      order-6 eps=1e-4 -> phi~0.0602.
 
 CPU-only, minutes-scale (marked slow)::
 
@@ -142,18 +142,16 @@ def test_order_monotonicity_when_accuracy_limited(laws, panel):
 def test_committed_fallback_law_gives_expected_production_phi():
     """(e) the committed FORCE-rel FALLBACK_LAW reproduces the bisected anchors.
 
-    At eps=1e-4 the cons kernel gives phi=0.032 (order-4) / 0.068 (order-6).
-    The old back-fit that made eps=1e-4 -> phi~0.10 was optimistic by ~30x in
-    force-rel (phi=0.10 is really force-rel ~2e-3); the validated production
-    grid deliberately uses the coarser phi=0.10 (adequate; RDF/density match
-    DPA).
+    At eps=1e-4 the cons kernel gives phi=0.0267 (order-4) / 0.0602 (order-6)
+    with the paper's reference coefficients (C4=1.0e-1, C6=2.4e-2), adopted in
+    deepmd-kit-LR @ a266642d2 so this rule matches sog.cpp and the in-graph op.
     """
     smin_c = sigma_min_of(BW_CONS)
     phi4 = phi_max(smin_c, RCUT, 4, 1.0e-4)
     phi6 = phi_max(smin_c, RCUT, 6, 1.0e-4)
-    assert abs(phi4 - 0.0321) / 0.0321 < 0.05, (
-        f"(e) cons order-4 eps=1e-4 (force) -> phi={phi4:.4f}, expected ~0.032"
+    assert abs(phi4 - 0.0267) / 0.0267 < 0.05, (
+        f"(e) cons order-4 eps=1e-4 (force) -> phi={phi4:.4f}, expected ~0.0267"
     )
-    assert abs(phi6 - 0.0685) / 0.0685 < 0.05, (
-        f"(e) cons order-6 eps=1e-4 (force) -> phi={phi6:.4f}, expected ~0.068"
+    assert abs(phi6 - 0.0602) / 0.0602 < 0.05, (
+        f"(e) cons order-6 eps=1e-4 (force) -> phi={phi6:.4f}, expected ~0.0602"
     )

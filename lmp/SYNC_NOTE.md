@@ -1,58 +1,82 @@
-# Sync note: `sog/lmp` ↔ `deepmd-kit/source/lmp`
+# Sync note: `sog/` ↔ `deepmd-kit-LR`
 
-The plugin here tracks the canonical sources in
-`/data/home/public/jiangzhen/dp/deepmd-kit/source/lmp/` with one deliberate
-difference: **every model-specific piece was moved behind two abstract classes**
-so SOG can serve any MLIP, not just DeepMD.
+The SOG code in this repository mirrors the active development tree
+`/data/home/public/jiangzhen/dp/deepmd-kit-LR` (branch `feat/sezm-sog`).
+**LR is the source of truth**; this repository vendors/ports the generic parts
+and keeps an explicit record of what is copied verbatim, what is patched, and
+what is deliberately deferred.
 
-The exact interface diff is `patches/sog-model-agnostic.diff` — **verified to
-apply cleanly** to an unmodified deepmd-kit tree (`git apply --check` from the
-deepmd-kit root, then reproduces these files byte-for-byte). It is **not
-applied** to deepmd-kit; the deepmd-kit repo keeps working through its own
-copies. Apply it only when the abstraction should flow upstream:
+## Pinned upstream
 
-```bash
-cd /path/to/deepmd-kit
-git apply --check /data/home/public/jiangzhen/sog/lmp/patches/sog-model-agnostic.diff
-git apply         /data/home/public/jiangzhen/sog/lmp/patches/sog-model-agnostic.diff
+```
+repo:   /data/home/public/jiangzhen/dp/deepmd-kit-LR
+branch: feat/sezm-sog
+commit: a266642d2ae797ef818575d50dbc4c43b8e3d7ca
 ```
 
-## What the patch changes (10 files, ~4 modified + 6 added)
+Update the pin only together with `scripts/sync_from_lr.sh` and a full test run.
 
-| File | Δ | What |
-|---|---|---|
-| `sog.cpp` | +31/−7 | Reads charges through a `SogChargeSource` (resolution: registered source → deepmd adapter → `atom->q`) instead of `dynamic_cast<PairDeepMD*>`; conditional include of the adapter; destructor deletes the default source. |
-| `sog.h` | +11 | `set_charge_source()` / `get_charge_source()`; `charge_source` + owned `default_charge_source` members. |
-| `fix_sog_response.cpp` | rewritten (+210) | Talks only to `SogChargeResponse`. Adds the `model`/`fused`/`pair_deepmd_index` keyword parsing, the adapter factory, and `FixSOGResponse::build_input_nlist()` (see below). All deepmd members, the pair match by name and the standalone `DeepPot` moved to the adapter. |
-| `fix_sog_response.h` | rewritten (+56) | Holds `SogChargeResponse*` + `SOGKSpace*` instead of `PairDeepMD`/`DeepPot`/`type_idx_map`. |
-| `sog_charge_source.h` (new) | — | Coupling #2 contract. |
-| `sog_charge_response.h` (new) | — | Coupling #3 contract. |
-| `adapters/deepmd_charge_source.h` (new) | — | `PairDeepMD` → `SogChargeSource` (~15 lines); guards an empty `dcharge_multi` (model with `latent_charge_to_q` off previously read out of bounds). |
-| `adapters/deepmd_charge_response.cpp/.h` (new) | — | The retained-graph VJP (`enable_charge_only_forward`, `enable_charge_response_graph`, `compute_*_response_cached`, standalone `compute_charge_response` fallback). |
-| `adapters/native_charge_response.h` (new) | — | Documented no-op for fixed-charge frameworks. |
+## Vendored byte-for-byte (never hand-edit)
 
-Unchanged and byte-identical: `sog_spline.h`, `sog_gpu.cu`, `sog_gpu.cuh`.
+| File here | Source in LR |
+|---|---|
+| `lmp/sog_gpu.cu` | `source/lmp/sog_gpu.cu` |
+| `lmp/sog_gpu.cuh` | `source/lmp/sog_gpu.cuh` |
+| `lmp/sog_spline.h` | `source/lmp/sog_spline.h` |
+| `lmp/sog_charge_source.h` | `source/lmp/sog_charge_source.h` |
+| `op/sog_kspace/sog_kspace_op.cc` | `source/op/pt/sog_kspace/sog_kspace_op.cc` |
+| `op/sog_kspace/sog_green.h` | `source/op/pt/sog_kspace/sog_green.h` |
 
-**Deliberately dropped:** `type_idx_map` in the canonical `fix_sog_response.cpp`
-was built every step and never read (dead code); the rewrite omits it.
+The op library is built from `op/CMakeLists.txt` and compiles the vendored
+`lmp/sog_gpu.cu` unchanged, so the in-graph solver reproduces the deployed
+discretization exactly.
 
-**Not in this patch** (they exist for the *standalone plugin* build only, and
-deepmd-kit has its own plugin CMakeLists): `sogplugin.cpp`,
-`sog_gpu_stub.cpp`, `CMakeLists.txt`, `tests/`.
+Grid sizing follows the same phi_max rule in all three places — `op/sog_kspace/
+sog_green.h` (in-graph op), `lmp/sog.cpp` (old chain) and the Python
+`sog.tools.phi_max_rule` — using the paper's reference coefficients
+(C₄ = 1.0e-1, C₆ = 2.4e-2, adopted in LR `a266642d2`).  Keep them in lockstep.
 
-## The one subtlety: `build_input_nlist`
+## Patched (LR behaviour + model-agnostic abstraction)
 
-`deepmd::InputNlist` needs the comm-brick layout (`nswap`, `sendnum`,
-`sendlist`, …), which `CommBrickDeepMD` exposes only to
-`friend class PairDeepMD` and `friend class FixSOGResponse`
-(`deepmd-kit/source/lmp/pair_deepmd.h:41-44`). The deepmd adapter class is not
-a friend, so the fallback's neighbor list cannot be assembled there **without
-editing deepmd-kit to widen the friendship**.
+| File here | Difference |
+|---|---|
+| `lmp/sog.cpp`, `lmp/sog.h` | `SogChargeSource` indirection (`set_charge_source` / `get_charge_source`); no `pair_deepmd` include |
+| `lmp/fix_sog_response.cpp/.h` | talks only to `SogChargeResponse` (adapters in `lmp/adapters/`); `thermo_virial = 1` added |
+| `lmp/sog_charge_response.h` | extended contract documentation (complete box-strain derivative) |
 
-Instead, the access lives in
-`FixSOGResponse::build_input_nlist()` — a member of the one class that *is* a
-friend — and the adapter calls it through a back-pointer, which the fix hands
-over at construction (`create_charge_response(lmp, this, ...)`).
+The patch is `lmp/patches/sog-model-agnostic.diff` (regenerate against the
+pinned SHA; `git apply --check` must pass on an unmodified LR tree).
 
-Consequence for any upstream port: keep the free function/member split as is,
-or widen the friendship in pair_deepmd.h (a deepmd-kit change).
+## Deliberately deferred (P2 debt)
+
+These LR features are **not** in this repository yet; the old chain remains
+unchanged and functional without them:
+
+- `box_tol` keyword (NPT green-table reuse);
+- PPPM-style distributed mesh (`compute_distributed`, `Grid3d`/`Remap`);
+- Kokkos device k-space (`kspace_style sog/kk`);
+- the device charge-response branch (`compute_charge_response_device`);
+- `make_comm_nlist` / multi-rank response artifacts;
+- solver-side global latent-charge neutralization inside `sog.cpp`.
+
+New Python-side work lives in the isolated `sog.v2` package and does not touch
+`lmp/`'s behaviour beyond the items above.
+
+## How to sync
+
+```bash
+bash scripts/sync_from_lr.sh            # copies the vendored files
+git diff --stat                         # review
+# rebuild + test (see lmp/README.md and docs/08-validation.md)
+```
+
+The script refuses to modify the LR tree; it only copies out of it.
+
+## The `build_input_nlist` subtlety (unchanged)
+
+`deepmd::InputNlist` needs the comm-brick layout (`nswap`, `sendnum`, …),
+which `CommBrickDeepMD` exposes only to `friend class PairDeepMD` and
+`friend class FixSOGResponse` (`deepmd-kit/source/lmp/pair_deepmd.h`).  The
+generic adapter cannot read it, so the access lives in
+`FixSOGResponse::build_input_nlist()` and the DeepMD adapter calls it through a
+back-pointer.  Keep that split when syncing, or widen the friendship upstream.

@@ -109,3 +109,18 @@ relative; measured ~1e-15); the numbers it must reproduce and the unit-constant
 traps are in [08-validation.md](08-validation.md). The inputs default the
 plugin path to `../build/libsog_lmp.so`; override with
 `lmp -var plugin /abs/path -in …`.
+
+## Relationship to the PyTorch deployment layer
+
+This plugin implements the **old chain** (`kspace_style sog` + `fix
+sog/response`).  The in-graph operator and the `.pt2` artifacts used by the
+1F+1B chain are built separately from `op/` — see
+[09-in-graph-kspace.md](09-in-graph-kspace.md) and
+[10-export-and-artifacts.md](10-export-and-artifacts.md).  A framework that
+adopts the single-graph chain runs with `kspace_style none` and no fix; the
+plugin is then not loaded.
+
+The plugin deliberately trails the active tree on a few features (documented
+in [11-lr-sync.md](11-lr-sync.md)): `box_tol`, the distributed mesh,
+`kspace sog/kk`, and the device response branch.  The old chain works without
+them; the in-graph op already has `box_tol`.

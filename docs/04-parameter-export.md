@@ -88,3 +88,15 @@ bit-exact. When sharing kernel files across teams, include the version marker.
 - [ ] `remove_self_interaction` written explicitly and equal on both sides.
 - [ ] `phi_max` (or `n_dl`) chosen for the target MD resolution; recorded.
 - [ ] A 0-step LAMMPS run on a test geometry reproduces Python `E_lr` (see 08).
+
+## Deployment artifacts (`.pt2`)
+
+Besides the `kspace_style sog ...` line used by the old chain, the training
+parameters can be frozen into AOTInductor artifacts for the two deployment
+chains (`sog.v2.export`).  Names, metadata flags and ABIs are in
+[10-export-and-artifacts.md](10-export-and-artifacts.md); the conventions that
+still apply are the same:
+
+- the solver consumes `amp` (internal) and `bandwidth` **squared**;
+- grid coefficients: see [09-in-graph-kspace.md](09-in-graph-kspace.md)
+  §Grid sizing — do not restate them here.
