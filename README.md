@@ -18,7 +18,7 @@ parameter export, and the LAMMPS plugin/adapter porting path.
 The Gaussian kernel internally uses:
 
 $$
-kfac = \sum_m amp^{\text{internal}}_m\,\exp\left(-\tfrac{1}{2}bw^2_m\,k^2\right)
+kfac = \sum_m amp^{\text{internal}}_m\,\exp\left(-\tfrac{1}{2}bw^2_m k^2\right)
 $$
 
 `Sog` accepts two concise mode keys to describe how your input tensors are interpreted:
