@@ -91,6 +91,9 @@ Reference implementations, smallest first:
   Emit the keyword explicitly on the C++ side.
 - The response seed is `Σ v·q`, **not** `½ Σ v·q` (`v` is frozen; the `½`
   belongs to the reported energy only).
+- The self term is `½·Σq²·g(0)`, `g(0) = Σ_m amp_m (2π bw_m)^(-3/2)`: exactly
+  volume-extensive, with **zero** self virial.  Never use the mesh sum
+  `Σ_k K/V` (not extensive; injects spurious shear).
 - Divide the seed by the **owned** node count (`n_local`), not the total — else
   multi-rank force/pressure are off by `n_local/nnode`.
 - Virial order: the op returns `(xx,yy,zz,xy,xz,yz)`; DeepMD wants row-major

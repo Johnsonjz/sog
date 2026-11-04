@@ -217,6 +217,9 @@ else()
   message(STATUS "MPI not found — using LAMMPS STUBS serial mpi.h")
 endif()
 
+# dlopen/dlsym for the NCCL device collectives in sog_gpu.cu (libdl on glibc<2.34).
+target_link_libraries(sog_lmp PRIVATE ${CMAKE_DL_LIBS})
+
 # ── FFT (the fft3d_wrap.h dispatcher must match the LAMMPS binary) ──
 # Default FFT_KISS: built into LAMMPS itself, zero external dependencies —
 # the kissfft symbols resolve from the LAMMPS binary.  Override with

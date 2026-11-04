@@ -667,14 +667,22 @@ void SOGKSpace::settings(int narg, char **arg) {
 
 void SOGKSpace::finalize_kernel_parameters() {
   // When amp/bandwidth are externally provided (e.g. from a frozen DeepMD
-  // model), skip internal generation and set self_coeff = 0.
+  // model), skip internal generation but still build the exact self_coeff.
   if (amp_from_user) {
     if (amp.empty() || bandwidth.empty())
       error->all(FLERR, "sog external amp/bandwidth must both be provided");
     if (amp.size() != bandwidth.size())
       error->all(FLERR, "sog amp and bandwidth must have same length");
     M_param = static_cast<int>(amp.size());
+    // ── Exact self-energy coefficient ──────────────────────────────────────
+    // E_self = ½·Σq²·g(0) with g(0) = Σ_m amp_m (2π β_m)^(-3/2).  Real-space
+    // quantity: exactly ∝ q², so exactly volume-extensive, and zero strain
+    // derivative (no self virial).  Replaces the old mesh Riemann sum
+    // `diag_sum`, which was not extensive (9.03x for a 2x cell).
     self_coeff = 0.0;
+    for (size_t m = 0; m < amp.size(); ++m) {
+      self_coeff += 0.5 * amp[m] * std::pow(2.0 * MY_PI * bandwidth[m], -1.5);
+    }
     finalize_virial_parameters();
     // Total SOG amplitude at k=0: A = Σ_m amp_m
     amp_sum = 0.0;
@@ -1066,8 +1074,7 @@ void SOGKSpace::ensure_fft_plan() {
       if (!gpu_) gpu_ = sog_gpu_create();
       sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                     mesh_green_energy.data(), mesh_green_force.data(),
-                    mesh_green_self.data(), mesh_green_virial.data(),
-                    mesh_green_self_virial.data());
+                    mesh_green_virial.data());
     }
     return;
   }
@@ -1116,8 +1123,7 @@ void SOGKSpace::ensure_fft_plan() {
     if (!gpu_) gpu_ = sog_gpu_create();
     sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                   mesh_green_energy.data(), mesh_green_force.data(),
-                  mesh_green_self.data(), mesh_green_virial.data(),
-                  mesh_green_self_virial.data());
+                  mesh_green_virial.data());
   }
   if (use_direct) enumerate_direct_kvecs();
   mesh_ready = true;
@@ -1953,11 +1959,11 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   const double twopi_over_z = MY_2PI / mesh_lz;
 
   double energy_local = 0.0;
+  // diag_sum_local / sv_local are kept for the SOG_DUMP_* diagnostics only;
+  // the self term is the closed-form self_coeff (no mesh sampling), so they
+  // stay zero and no longer feed energy / potential / virial.
   double diag_sum_local = 0.0;
   std::array<double, 6> fv_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  // Anisotropic self-energy stress accumulator: Σ_mesh K_v(k²)·k_α k_β. Combined with
-  // diag_sum (Σ K) it gives the strain-derivative of the reciprocal self-removal energy
-  // −qscale·qsqsum·Σ K/(2V), which the reciprocal virial omits (~2.5%→~0.5% fix).
   std::array<double, 6> sv_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
   for (int iz = 0; iz < mesh_nz; ++iz) {
@@ -1987,7 +1993,8 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
           continue;
         }
 
-        diag_sum_local += mesh_green_self[idx];
+        // (diag_sum is no longer sampled from the mesh: the self term is the
+        //  exact closed-form self_coeff. See finalize_kernel_parameters.)
 
         const double rho_re =
             static_cast<double>(mesh_fft_work[2 * idx]);
@@ -2016,15 +2023,8 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
           fv_local[3] += s2 * rho2 * (-gv * kx * ky);
           fv_local[4] += s2 * rho2 * (-gv * kx * kz);
           fv_local[5] += s2 * rho2 * (-gv * ky * kz);
-          // Anisotropic self-energy stress: Σ bare K_v(k²)·k_α k_β (config-independent,
-          // like diag_sum_local; combined with diag_sum in the virial finalize below).
-          const double gsv = mesh_green_self_virial[idx];
-          sv_local[0] += gsv * kx * kx;
-          sv_local[1] += gsv * ky * ky;
-          sv_local[2] += gsv * kz * kz;
-          sv_local[3] += gsv * kx * ky;
-          sv_local[4] += gsv * kx * kz;
-          sv_local[5] += gsv * ky * kz;
+          // No self-energy stress accumulator: the exact self term is
+          // independent of V and the cell, so its strain derivative is zero.
         }
 
         if (spline_type < 4) {
@@ -2251,17 +2251,9 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     double energy_all = 0.0;
     MPI_Allreduce(&energy_local, &energy_all, 1, MPI_DOUBLE, MPI_SUM, world);
 
-    double diag_sum_all = 0.0;
-    MPI_Allreduce(&diag_sum_local, &diag_sum_all, 1, MPI_DOUBLE, MPI_SUM,
-                  world);
-
     energy = 0.5 * volume * energy_all;
-    if (remove_self_interaction) {
-      const double self_term = diag_sum_all / (2.0 * volume);
-      energy -= qsqsum_all * self_term;
-    }
-    // Also subtract the real-space self-energy (matching RBSOG convention)
-    energy -= self_coeff * qsqsum_all;
+    // Self-energy: ½·Σq²·g(0) = self_coeff·Σq². Exactly extensive, no mesh.
+    if (remove_self_interaction) energy -= self_coeff * qsqsum_all;
 
     // The k≠0 Fourier modes, real-space self-energy, and mesh self-term
     // fully define the SOG long-range energy. k=0 is excluded (Σq=0 by
@@ -2271,16 +2263,11 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   }
 
   // ── Self-energy part of the per-atom potential v_i = ∂E_k/∂q_i ──
-  // E_self = qscale·[ −(rsi)·qsqsum·diag_sum/(2V) − self_coeff·qsqsum ]
-  //   ⇒ ∂E_self/∂q_i = −qscale·q_i·[ (rsi)·diag_sum/V + 2·self_coeff ]
+  // E_self = −qscale·self_coeff·Σq²  ⇒  ∂E_self/∂q_i = −qscale·q_i·2·self_coeff
   if (want_potential) {
-    double diag_sum_all_p = 0.0;
-    MPI_Allreduce(&diag_sum_local, &diag_sum_all_p, 1, MPI_DOUBLE, MPI_SUM, world);
-    const double rsi_coef =
-        remove_self_interaction ? (diag_sum_all_p / volume) : 0.0;
-    const double self_c = 2.0 * self_coeff;
+    const double rsi_coef = remove_self_interaction ? 2.0 * self_coeff : 0.0;
     for (int i = 0; i < nlocal; ++i) {
-      vpot[i] -= qscale * q[i] * (rsi_coef + self_c);
+      vpot[i] -= qscale * q[i] * rsi_coef;
     }
     if (getenv("SOG_DUMP_POT") && comm->me == 0) {
       utils::logmesg(lmp, fmt::format(
@@ -2307,28 +2294,10 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     MPI_Allreduce(fv_local.data(), vf_all, 6, MPI_DOUBLE, MPI_SUM, world);
     for (int j = 0; j < 6; ++j) virial[j] = 0.5 * volume * qscale * vf_all[j];
 
-    // Self-energy strain-derivative: the self-energy removal contributes
-    // ZERO force (∂qsq/∂r=0 when charges are fixed), but its STRAIN
-    // derivative is non-zero and must be added for the complete virial.
-    //   W_self_αβ = (qscale·qsqsum/2V)·(Σ K_v·k_α k_β − δ_αβ·Σ K)
-    // The prefactor is qscale·qsqsum/(2V) — NO /3. The /3 was a code-
-    // evolution artifact (the diagnostic dump variable correctly stored
-    // the un-divided prefactor, but the actual computation incorrectly
-    // divided by 3). Verified against fastsog.cpp, Python mesh_reciprocal_virial,
-    // and the analytic W_self strain-derivative formula.
-    if (remove_self_interaction) {
-      double sv_all[6] = {0.0};
-      MPI_Allreduce(sv_local.data(), sv_all, 6, MPI_DOUBLE, MPI_SUM, world);
-      double diag_sum_all_v = 0.0;
-      MPI_Allreduce(&diag_sum_local, &diag_sum_all_v, 1, MPI_DOUBLE, MPI_SUM, world);
-      const double sv_pref = qscale * qsqsum_all / (2.0 * volume);
-      virial[0] += sv_pref * (sv_all[0] - diag_sum_all_v);
-      virial[1] += sv_pref * (sv_all[1] - diag_sum_all_v);
-      virial[2] += sv_pref * (sv_all[2] - diag_sum_all_v);
-      virial[3] += sv_pref * sv_all[3];
-      virial[4] += sv_pref * sv_all[4];
-      virial[5] += sv_pref * sv_all[5];
-    }
+    // No self-energy virial: the exact self term is qsum_sq * g(0) / 2,
+    // independent of V and of the cell, so its strain derivative is identically
+    // zero. (The old mesh version was anisotropic -- 0.827/1.085/1.339 x the
+    // diagonal at a 264-atom cell -- and injected a spurious shear.)
 
     // ── Diagnostic virial dump (full decomposition) ──
     if (getenv("SOG_DUMP_VIRIAL") && comm->me == 0) {
@@ -2680,14 +2649,9 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     double qsqsum_all;
     MPI_Allreduce(&qsqsum, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
     if (remove_self_interaction) {
-      // Compute diag_sum from direct k-vectors (half-sphere: each k counted once).
-      // Full-sum self-energy = -qscale/(2V)·Σ_{full} K(k²)·qsqsum
-      //                    = -qscale/(2V)·(2·Σ_{half} K)·qsqsum
-      //                    = -qscale·diag_sum·qsqsum/V
-      double diag_sum_half = 0.0;
-      for (size_t ik = 0; ik < (size_t)nk_direct; ++ik)
-        diag_sum_half += kfac_d[ik];
-      etot -= qscale * qsqsum_all * diag_sum_half / volume;
+      // Exact self coefficient, same closed form as every other path.
+      (void)nk_direct;
+      etot -= qscale * self_coeff * qsqsum_all;
     }
     energy = etot;
   }

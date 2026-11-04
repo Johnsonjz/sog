@@ -152,6 +152,18 @@ class TraceableSogKernel(nn.Module):
         mk = mask.to(dtype)
         return g_cart, ksq, kfac * mk, kfac_v * mk
 
+    def _self_kernel_sum(self, dtype, device):
+        """``g(0) = Σ_m A_m (2π β_m)^(-3/2)``: the kernel at zero separation.
+
+        The exact ``i == j, R == 0`` term of the real-space pair potential.
+        Being real-space it is exactly ∝ q² (hence exactly volume-extensive)
+        and has zero strain derivative (hence no self virial).  Materialised
+        inside the traced function as a constant tensor (FakeTensor-safe).
+        """
+        amp = torch.tensor(self._amp, dtype=dtype, device=device)
+        bw2 = torch.tensor(self._bw2, dtype=dtype, device=device)
+        return (amp * (2.0 * math.pi * bw2) ** (-1.5)).sum()
+
     def _canon(self, positions: torch.Tensor, q: torch.Tensor, cell: Optional[torch.Tensor]):
         if positions.dim() == 2:
             positions = positions.unsqueeze(0)
@@ -191,7 +203,11 @@ class TraceableSogKernel(nn.Module):
         s_sq = s_re * s_re + s_im * s_im                  # (nf,Nk)
         e = (kfac.flatten(1) * s_sq).sum(1) / (2.0 * volume)
         if self.remove_self_interaction:
-            e = e - (q * q).sum(1) * kfac.flatten(1).sum(1) / (2.0 * volume)
+            # Exact i==j term: ½·Σq²·g(0).  The old mesh sum Σ_k K / V is only a
+            # Riemann approximation and is NOT volume-extensive (it grew ~9x for
+            # a 2x cell); g(0) is exact and real-space.
+            g0 = self._self_kernel_sum(positions.dtype, positions.device)
+            e = e - 0.5 * (q * q).sum(1) * g0
         return e * self.norm_factor
 
     def solution(self, qn: torch.Tensor, positions: torch.Tensor, cell: torch.Tensor):
@@ -213,30 +229,26 @@ class TraceableSogKernel(nn.Module):
         # v_i = (1/V) sum_k K (S_re cos + S_im sin) - (q_i/V) sum_k K
         v = torch.einsum("fk,fnk->fn", kf, s_re * cos_kr + s_im * sin_kr) / volume.unsqueeze(1)
         if self.remove_self_interaction:
-            v = v - qn * kf.sum(1).unsqueeze(1) / volume.unsqueeze(1)
+            # ∂E_self/∂q_i = -q_i·g(0); the mesh Σ_k K / V was only an approximation.
+            g0 = self._self_kernel_sum(positions.dtype, positions.device)
+            v = v - qn * g0
 
         # F_i = -(q_i/V) sum_k K k (S_im cos - S_re sin)
         f_weight = (s_im.unsqueeze(1) * cos_kr - s_re.unsqueeze(1) * sin_kr)  # (nf,nloc,Nk)
         f_dir = -qn.unsqueeze(-1) * torch.einsum("fk,fka,fnk->fna", kf, kvec, f_weight)
         f_dir = f_dir / volume.view(nf, 1, 1)
 
-        # vir6 = k-space + self strain derivatives (both complete strain forms)
-        #   W_ks   = (1/2V) sum_k [K d_ab - K_v k_a k_b] |S|^2
-        #   W_self = (1/2V) q^2sum [sum_k K_v k_a k_b - d_ab sum_k K]
+        # vir6 = k-space strain derivative (complete strain form).
+        #   W_ks = (1/2V) sum_k [K d_ab - K_v k_a k_b] |S|^2
+        # No self-energy virial: the exact self term ½·Σq²·g(0) is independent
+        # of V and the cell, so its strain derivative is identically zero.  (The
+        # old mesh Σ K_v k_a k_b was anisotropic and injected spurious shear.)
         eye = torch.eye(3, dtype=positions.dtype, device=positions.device).view(1, 1, 3, 3)
         kk = kvec.unsqueeze(-1) * kvec.unsqueeze(-2)      # (nf,Nk,3,3)
         s_sq_e = s_sq.unsqueeze(-1).unsqueeze(-1)
-        w_ks = (kf.unsqueeze(-1).unsqueeze(-1) * eye
-                - kv.unsqueeze(-1).unsqueeze(-1) * kk) * s_sq_e
-        w_ks = w_ks.sum(1) / (2.0 * volume.view(nf, 1, 1))
-        if self.remove_self_interaction:
-            qsq = (qn * qn).sum(1).view(nf, 1, 1)
-            w_self = qsq * (kv.unsqueeze(-1).unsqueeze(-1) * kk).sum(1)
-            w_self = w_self - qsq * kf.sum(1).view(nf, 1, 1) * eye.view(1, 3, 3)
-            w_self = w_self / (2.0 * volume.view(nf, 1, 1))
-            w = w_ks + w_self
-        else:
-            w = w_ks
+        w = (kf.unsqueeze(-1).unsqueeze(-1) * eye
+             - kv.unsqueeze(-1).unsqueeze(-1) * kk) * s_sq_e
+        w = w.sum(1) / (2.0 * volume.view(nf, 1, 1))
         vir6 = torch.stack(
             [w[:, 0, 0], w[:, 1, 1], w[:, 2, 2], w[:, 0, 1], w[:, 0, 2], w[:, 1, 2]], dim=1
         ) * self.norm_factor

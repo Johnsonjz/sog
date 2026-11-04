@@ -11,7 +11,7 @@ deliberately left behind.
 ```
 repo:   /data/home/public/jiangzhen/dp/deepmd-kit-LR
 branch: feat/sezm-sog
-commit: a266642d2ae797ef818575d50dbc4c43b8e3d7ca
+commit: 156a84d5baeb8bfb5c2f79ac156f3fe6913906d4
 ```
 
 `sog/lmp/SYNC_NOTE.md` is the authoritative record; `scripts/sync_from_lr.sh`

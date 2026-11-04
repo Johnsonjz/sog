@@ -7,7 +7,7 @@
 set -euo pipefail
 
 LR_ROOT="${LR_ROOT:-/data/home/public/jiangzhen/dp/deepmd-kit-LR}"
-PIN="a266642d2ae797ef818575d50dbc4c43b8e3d7ca"
+PIN="156a84d5b"
 
 DEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="${LR_ROOT}/source"

@@ -78,19 +78,25 @@ def test_solve_matches_python_cubes2():
     (g_r,) = torch.autograd.grad(e_ref, r)
     f_ref = -g_r
 
-    e_scale = max(abs(e_ref.item()), 1e-6)
-    assert abs(e_op.item() - e_ref.item()) / e_scale < 2e-2, (
-        f"E op {e_op.item()} vs py {e_ref.item()}"
+    # Energy: compare against the direct k-sum, which uses the SAME closed-form
+    # self term as the op (½Σq²·g(0)).  The legacy ``Gaussian`` still uses the
+    # old mesh self sum (not volume-extensive), so it is only a *force*
+    # reference here — the self term has no force.
+    delta = phi * 5.0
+    tk = TraceableSogKernel.from_kernel(
+        k, n_dl=delta, nk=int(math.ceil(12.0 / delta)) + 1
+    )
+    cell3 = torch.eye(3, dtype=torch.float64).unsqueeze(0) * 12.0
+    e_direct = tk.energy(q, pos, cell3).sum()
+    e_scale = max(abs(e_direct.item()), 1e-6)
+    assert abs(e_op.item() - e_direct.item()) / e_scale < 2e-2, (
+        f"E op {e_op.item()} vs direct {e_direct.item()}"
     )
     df = (f_dir.cpu() - f_ref).abs().max().item()
     assert df / f_ref.abs().max().item() < 2e-2
 
     # Complete-virial reference: the static direct k-sum (analytic derivatives).
-    delta = phi * 5.0
-    tk = TraceableSogKernel.from_kernel(
-        k, n_dl=delta, nk=int(math.ceil(12.0 / delta)) + 1
-    )
-    _v, _f, vir_ref = tk.solution(q, pos, torch.eye(3, dtype=torch.float64).unsqueeze(0) * 12.0)
+    _v, _f, vir_ref = tk.solution(q, pos, cell3)
     dv = (vir6.cpu() - vir_ref[0]).abs().max().item()
     assert dv / max(vir_ref[0].abs().max().item(), 1e-6) < 2e-2, (
         f"vir6 op {vir6.tolist()} vs direct reference {vir_ref[0].tolist()}"

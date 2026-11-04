@@ -37,8 +37,11 @@ Rules:
 - **ABI = libtorch's.**  This is *not* the LAMMPS plugin: do not apply
   `SOG_GLIBCXX_OLD_ABI`.  Use `${TORCH_CXX_FLAGS}` (the CMake project does).
 - `CXX` must be a plain `g++`, never `mpiCC`/`mpicxx`.
-- `SOG_WITH_MPI=ON` compiles the replicated-grid `MPI_Allreduce` path; without
-  it the op solves single-rank.
+- **MPI is required** (`SOG_WITH_MPI=ON`): the distributed slab solve calls
+  `MPI_Alltoallv`.  Use OpenMPI or Intel MPI — the vendored `set_comm` casts the
+  handle through `reinterpret_cast<MPI_Comm>`, which needs `MPI_Comm` to be a
+  pointer; MPICH's `int` handle fails to compile.  The build also links
+  `${CMAKE_DL_LIBS}` because `sog_gpu.cu` reaches NCCL via `dlopen`.
 - The kernels need `atomicAdd(double)` → CUDA arch ≥ sm_60 when building the
   LAMMPS plugin (`lmp/CMakeLists.txt` defaults to 70).
 
@@ -99,6 +102,23 @@ CubeS₂ order-4: `C_ν = 1.0e-1, p_ν = 4`; order-6: `C_ν = 2.4e-2, p_ν = 6`
 The same rule is implemented in `sog.tools.phi_max_rule`, `op/sog_kspace/
 sog_green.h` and `lmp/sog.cpp`; changing one without the others makes the
 chains disagree.
+
+## Self-energy (closed form)
+
+The solver drops `k = 0`, so the `i == j, R == 0` term of the underlying pair
+potential is added back as a **real-space scalar**:
+
+```
+E_self = ½ · Σq² · g(0),     g(0) = Σ_m amp_m (2π bw_m)^(-3/2)
+```
+
+with `bw` the **squared** bandwidth.  It is exactly `∝ q²` (hence exactly
+volume-extensive) and has **zero strain derivative** (no self virial).  The
+`self_coeff` schema argument is **half** of `g(0)`; whatever is passed is added
+to the exact term the op computes internally, so pass `0.0` (the default) to get
+the exact self term.  Do **not** reproduce the old mesh sum `Σ_k K / V`: it was
+not volume-extensive (≈9× for a 2× cell) and its isotropic error injected a
+spurious shear.
 
 ## `box_tol`
 

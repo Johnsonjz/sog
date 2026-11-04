@@ -10,6 +10,7 @@
    silently computing wrong physics.
 ------------------------------------------------------------------------- */
 
+#include <cstddef>  // size_t, used by sog_gpu.cuh (no torch/LAMMPS header here)
 #include "sog_gpu.cuh"
 
 #include <cstdio>
@@ -29,7 +30,7 @@ SogGpuState *sog_gpu_create() {
 void sog_gpu_destroy(SogGpuState *) {}
 
 void sog_gpu_setup(SogGpuState *, int, int, int, const double *, const double *,
-                   const double *, const double *, const double *) {}
+                   const double *) {}
 
 double sog_gpu_compute(SogGpuState *, int, const double *, const double *,
                        double, double, double, const double *, double, int, int,

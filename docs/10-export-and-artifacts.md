@@ -154,6 +154,7 @@ Mode-B artifacts for that consumer requires torch ≥ 2.6.
 | Grid differs from the deployed chain | unsquared `bandwidth` passed to the solver, or phi_max coefficients out of sync |
 | `.pt2` loads but pressure is wrong by ~38 % | virial component order: op gives `(xx,yy,zz,xy,xz,yz)`; deepmd wants row-major 3×3 |
 | AOTI artifact dlopen crashes | frozen with a different toolchain than the loader |
+| Energy not volume-extensive (2× cell ≠ 2× E) | self term taken from a mesh sum `Σ_k K/V` instead of the closed form `½·Σq²·g(0)` (see `docs/09`) |
 
 The reference fixture (`test/fixtures/tiny_charge_model.py`) implements all
 three protocols with closed-form physics and is the smallest working example.

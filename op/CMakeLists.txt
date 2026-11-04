@@ -69,6 +69,8 @@ target_link_libraries(sog_kspace_op PRIVATE
   ${TORCH_LIBRARIES}
   CUDA::cufft
   CUDA::cudart
+  # dlopen/dlsym for the NCCL device collectives in sog_gpu.cu (libdl on glibc<2.34).
+  ${CMAKE_DL_LIBS}
 )
 
 # Match libtorch's flags (this is what sets/keeps the C++11 ABI consistent).
