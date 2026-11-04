@@ -24,6 +24,7 @@ from ..kernel import (  # noqa: E402
     SOG_DEFAULT_SIGMA,
     compute_w0,
 )
+from ._self import self_diag  # noqa: E402
 
 
 E2_PER_ANGSTROM_TO_EV = 14.3996454784255
@@ -1072,7 +1073,7 @@ class Gaussian(nn.Module):
             g_cart_out = g_cart.reshape(3, -1)[:, mask_flat]         # [3, K]
             k_sq_flat = k_sq.reshape(-1)[mask_flat]                   # [K]
             kfac_out = (amp * torch.exp(-0.5 * bw2 * k_sq_flat.unsqueeze(-1))).sum(dim=-1)  # [K]
-            diag_sum = kfac_out.sum() / (2.0 * volume)
+            diag_sum = self_diag(amp, bw2)  # exact closed form (volume-extensive)
             # Cache for future frames with the same box (when enabled).
             if use_direct_cache:
                 self._direct_state_cache[cache_key] = (
@@ -1087,7 +1088,7 @@ class Gaussian(nn.Module):
             kfac_out = amp_3d * torch.exp(-0.5 * bw2_3d * k_sq.unsqueeze(-1))
             kfac_out = kfac_out.sum(dim=-1).masked_fill(~k_mode_mask, 0.0)
             g_cart_out = g_cart
-            diag_sum = kfac_out.sum() / (2.0 * volume)
+            diag_sum = self_diag(amp, bw2)  # exact closed form (volume-extensive)
 
         return {
             "r_raw": r_raw,
@@ -1239,7 +1240,7 @@ class Gaussian(nn.Module):
 
         # full-grid reciprocal sum (factor 1) == loop's half-sphere × 2
         e_recip = (kfac.unsqueeze(1) * s_sq).sum(dim=(1, 2)) * inv2v   # [nf]
-        diag_sum = kfac.sum(dim=1) * inv2v                            # [nf]
+        diag_sum = self_diag(amp, bw2)                                # exact closed form (scalar)
         q_sq_sum = (q_f * q_f).sum(dim=(1, 2))                        # [nf]
 
         pot = e_recip

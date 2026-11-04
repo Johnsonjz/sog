@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ._self import self_diag
 from .cubes2_spline import (
     CUBES2_NODES_4,
     XI_4,
@@ -696,7 +697,9 @@ class Cubes2FFTFunction(torch.autograd.Function):
             _rfft_w[:, :, 1:nx // 2] = 2.0
         else:
             _rfft_w[:, :, 1:] = 2.0
-        diag_sum_fft = (_rfft_w * kfac_fft).sum() / (2.0 * volume)
+        # Closed-form self term: ½·Σq²·g(0) is exactly volume-extensive; the old
+        # mesh sum Σ_k K/(2V) was not (≈9× for a 2× cell) and injected shear.
+        diag_sum_fft = self_diag(amp_dev, bw2_dev)
 
         # ── Spread + FFT + Energy (rho_scale=N/V; σ_s² cancels) ──
         rho_grid = cubes2_spread(q, r_frac, nx, ny, nz, xi=xi, order=order,
@@ -817,7 +820,7 @@ class Cubes2FFTFunction(torch.autograd.Function):
             deconv = ctx.deconv  # exp(+Σ σ_{s,α}² k_α²), replaces 1/|Φ|²
 
             prefactor_main = 0.5 * ctx.volume * ctx.s2_val  # ½·V/N⁶
-            prefactor_diag = 1.0 / (2.0 * ctx.volume)         # 1/(2V)
+            two_pi_bw = 2.0 * math.pi
 
             # k-space mask: match forward — exclude k=0 AND modes beyond Nyquist
             k_mask = (k_sq_bw <= ctx.k_sq_max) & (k_sq_bw > 0.0)  # [nz, ny, nx//2+1]
@@ -834,15 +837,17 @@ class Cubes2FFTFunction(torch.autograd.Function):
 
             if ctx.needs_input_grad[3]:
                 grad_amp = prefactor_main * weighted.sum(dim=(1, 2, 3))  # [M]
-                diag_all = (ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
-                grad_amp = grad_amp - ctx.q_sq_sum * diag_all
+                # Closed-form self: ∂E_self/∂amp_m = -½·Q²·(2π bw_m)^(-3/2)
+                grad_amp = grad_amp - ctx.q_sq_sum * 0.5 * (two_pi_bw * bw2_bw) ** (-1.5)
 
             if ctx.needs_input_grad[4]:
                 ksq_w = (-0.5 * k_sq_4d) * weighted        # [M, nz, ny, nx//2+1]
                 amp_4d = amp_bw.view(M, 1, 1, 1)
                 grad_bw2 = prefactor_main * (amp_4d * ksq_w).sum(dim=(1, 2, 3))
-                diag_all = (amp_4d * (-0.5 * k_sq_4d) * ctx._rfft_w * exp_all).sum(dim=(1, 2, 3)) * prefactor_diag
-                grad_bw2 = grad_bw2 - ctx.q_sq_sum * diag_all
+                # Closed-form self: ∂E_self/∂bw_m = +¾·Q²·amp_m·(2π)^(-3/2)·bw_m^(-5/2)
+                grad_bw2 = grad_bw2 - ctx.q_sq_sum * (
+                    0.5 * amp_bw * (-1.5) * two_pi_bw ** (-1.5) * bw2_bw ** (-2.5)
+                )
 
             if ctx.needs_input_grad[3] and grad_amp is not None:
                 grad_amp = grad_amp * norm_factor * grad_output
@@ -870,11 +875,11 @@ def mesh_reciprocal_virial(
 ) -> torch.Tensor:
     """Reciprocal virial W = −∂E/∂ε (3×3), matching the direct k-sum stress.
 
-    W_αβ = C·Σ w·|ρ̂|²·(g_E δ_αβ − g_V k_α k_β)                          [reciprocal sum]
-         + q²·norm·(Σ w·K_v·k_α k_β/(2V) − δ_αβ·Σ w·K/(2V))            [self-energy ∂/∂ε]
-    with C = norm·½·V·s2. The second line is the k=0/self strain-derivative that the
-    production formula (sog.cpp:1976-1993) DROPS — it is what closes the ~2.5%→~0.5% gap
-    (and makes the off-diagonal shear exact), for BOTH CubeS₂ and QuadS.
+    W_αβ = C·Σ w·|ρ̂|²·(g_E δ_αβ − g_V k_α k_β),  C = norm·½·V·s2.
+
+    No self-energy strain term: the exact self energy ½·Σq²·g(0) is independent
+    of V and the cell, so its strain derivative is identically zero.  ``kfac`` /
+    ``kfacv`` / ``qsq`` are kept for callers but unused.
     """
     dev, dt = rho_sq.device, rho_sq.dtype
     wr = rfft_w * rho_sq
@@ -890,20 +895,6 @@ def mesh_reciprocal_virial(
     W[0, 2] = W[2, 0] = -comp(KXr, KZr)
     W[1, 2] = W[2, 1] = -comp(KYr, KZr)
 
-    # Self-energy strain derivative (W_self_strain), matching C++ sog.cpp
-    ds = (rfft_w * kfac).sum() / (2.0 * vol)          # diag_sum
-    pv = qsq * norm_factor / (2.0 * vol)
-
-    def scomp(Ka, Kb):
-        return pv * (rfft_w * kfacv * Ka * Kb).sum()
-
-    off = qsq * norm_factor * ds
-    W[0, 0] = W[0, 0] + scomp(KXr, KXr) - off
-    W[1, 1] = W[1, 1] + scomp(KYr, KYr) - off
-    W[2, 2] = W[2, 2] + scomp(KZr, KZr) - off
-    W[0, 1] = W[1, 0] = W[0, 1] + scomp(KXr, KYr)
-    W[0, 2] = W[2, 0] = W[0, 2] + scomp(KXr, KZr)
-    W[1, 2] = W[2, 1] = W[1, 2] + scomp(KYr, KZr)
     return W
 
 
@@ -1035,7 +1026,7 @@ def compute_cubes2_fft(
     volume_val = volume.item() if isinstance(volume, torch.Tensor) else float(volume)
 
     # Self-interaction: Σ K(k²) / (2V) over k≠0
-    diag_sum_fft = (_rfft_w2 * kfac_fft).sum() / (2.0 * volume_val)
+    diag_sum_fft = self_diag(amp_dev, bw2_dev)
 
     # ── Spread + FFT + Energy (rho_scale=N/V) ──
     # ρ(k) ≈ (N/V)·S(k)·exp(-½σ_s²k²) (CubeS₂ ≈ Gaussian spread). With the
@@ -1083,8 +1074,8 @@ def compute_cubes2_fft(
 
         if compute_virial:
             # ── Analytic virial: complete strain-derivative of E_k ──
-            # W_αβ = C·Σ w·|ρ̂|²·(green_energy·δ_αβ − green_virial·k_α·k_β)  [reciprocal]
-            #      + q²·norm/(2V)·(Σ w·K_v·k_α·k_β − δ_αβ·Σ w·K)            [self-energy]
+            # W_αβ = C·Σ w·|ρ̂|²·(green_energy·δ_αβ − green_virial·k_α·k_β).  No
+            # self-energy strain term: ½·Σq²·g(0) is cell-independent.
             # The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
             # coordinate spreading + Form-B deconvolution. The analytic formula IS the
             # complete virial (verified vs finite-strain FD, 1e-9). Matches fastsog.cpp,

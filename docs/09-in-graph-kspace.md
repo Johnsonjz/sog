@@ -118,7 +118,9 @@ volume-extensive) and has **zero strain derivative** (no self virial).  The
 to the exact term the op computes internally, so pass `0.0` (the default) to get
 the exact self term.  Do **not** reproduce the old mesh sum `Σ_k K / V`: it was
 not volume-extensive (≈9× for a 2× cell) and its isotropic error injected a
-spurious shear.
+spurious shear.  The Python training solvers (`Gaussian`/`Sog`, and the CubeS₂
+and QuadS FFT paths) use the same closed form through
+`sog.module._self.self_diag`, so training and MD agree.
 
 ## `box_tol`
 

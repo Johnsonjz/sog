@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from ._self import self_diag
 from .cubes2_fft import _resolve_grid, mesh_reciprocal_virial
 from .quads_spline import (
     quads_xi, quads_offsets, quads_num_nodes_1d, quads_offset_polys, quads_1d_weights,
@@ -279,7 +280,7 @@ def compute_quads_fft(
     s2 = 1.0 / (N3 * N3)
     scaleinv = 1.0 / N3
     vol_val = volume.item() if isinstance(volume, torch.Tensor) else float(volume)
-    diag_sum_fft = (_rfft_w * kfac_fft).sum() / (2.0 * vol_val)
+    diag_sum_fft = self_diag(amp_dev, bw2_dev)
 
     # ── Spread + FFT + energy (rho_scale = N/V, as in CubeS₂) ──
     rho_grid = quads_spread(q, r_frac, nx, ny, nz, xi, order, rho_scale=N3 / vol_val)
